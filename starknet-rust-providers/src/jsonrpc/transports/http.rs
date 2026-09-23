@@ -5,7 +5,10 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
     ProviderRequestData,
-    jsonrpc::{JsonRpcMethod, JsonRpcResponse, transports::JsonRpcTransport},
+    jsonrpc::{
+        JsonRpcError, JsonRpcMethod, JsonRpcResponse,
+        transports::{BatchParseError, JsonRpcTransport, parse_batch_response},
+    },
 };
 
 /// A [`JsonRpcTransport`] implementation that uses HTTP connections.
@@ -30,6 +33,9 @@ pub enum HttpTransportError {
     /// Response carried an invalid numeric id that can't be matched to a request.
     #[error("response has an invalid numeric id")]
     InvalidNumericResponseId,
+    /// The server rejected the batch as a whole and returned a single JSON-RPC error.
+    #[error("batch request rejected: {0}")]
+    BatchError(JsonRpcError),
 }
 
 #[derive(Debug, Serialize)]
@@ -159,8 +165,7 @@ impl JsonRpcTransport for HttpTransport {
         let response_body = response.text().await.map_err(Self::Error::Reqwest)?;
         trace!("Response from JSON-RPC: {response_body}");
 
-        let parsed_response: Vec<JsonRpcResponse<serde_json::Value>> =
-            serde_json::from_str(&response_body).map_err(Self::Error::Json)?;
+        let parsed_response = parse_batch_response(&response_body)?;
 
         let mut responses: Vec<Option<JsonRpcResponse<serde_json::Value>>> = vec![];
         responses.resize(request_bodies.len(), None);
@@ -187,5 +192,14 @@ impl JsonRpcTransport for HttpTransport {
 
         let responses = responses.into_iter().flatten().collect::<Vec<_>>();
         Ok(responses)
+    }
+}
+
+impl From<BatchParseError> for HttpTransportError {
+    fn from(value: BatchParseError) -> Self {
+        match value {
+            BatchParseError::BatchRejected(error) => Self::BatchError(error),
+            BatchParseError::Json(err) => Self::Json(err),
+        }
     }
 }

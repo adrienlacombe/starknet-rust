@@ -4,7 +4,10 @@ use url::Url;
 
 use crate::{
     ProviderRequestData,
-    jsonrpc::{JsonRpcMethod, JsonRpcResponse, transports::JsonRpcTransport},
+    jsonrpc::{
+        JsonRpcError, JsonRpcMethod, JsonRpcResponse,
+        transports::{BatchParseError, JsonRpcTransport},
+    },
 };
 
 /// A [`JsonRpcTransport`] implementation for the Cloudflare Workers environment.
@@ -29,6 +32,9 @@ pub enum WorkersTransportError {
     /// Response carried an invalid numeric id that can't be matched to a request.
     #[error("response has an invalid numeric id")]
     InvalidNumericResponseId,
+    /// The server rejected the batch as a whole and returned a single JSON-RPC error.
+    #[error("batch request rejected: {0}")]
+    BatchError(JsonRpcError),
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -156,8 +162,7 @@ impl JsonRpcTransport for WorkersTransport {
         let mut response = Fetch::Request(req).send().await?;
         let response_body = response.text().await?;
 
-        let parsed_response: Vec<JsonRpcResponse<serde_json::Value>> =
-            serde_json::from_str(&response_body).map_err(Self::Error::Json)?;
+        let parsed_response = super::parse_batch_response(&response_body)?;
 
         let mut responses: Vec<Option<JsonRpcResponse<serde_json::Value>>> = vec![];
         responses.resize(request_bodies.len(), None);
@@ -196,5 +201,14 @@ impl From<serde_json::Error> for WorkersTransportError {
 impl From<worker::Error> for WorkersTransportError {
     fn from(value: worker::Error) -> Self {
         Self::Workers(value)
+    }
+}
+
+impl From<BatchParseError> for WorkersTransportError {
+    fn from(value: BatchParseError) -> Self {
+        match value {
+            BatchParseError::BatchRejected(error) => Self::BatchError(error),
+            BatchParseError::Json(err) => Self::Json(err),
+        }
     }
 }
