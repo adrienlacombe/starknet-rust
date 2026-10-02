@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `eth-keystore` is now an optional dependency of `starknet-rust-signers`, behind a new `keystore` feature that is enabled by default. `SigningKey::from_keystore`, `SigningKey::save_as_keystore` and `KeystoreError` require it. Crates that depend on `starknet-rust-signers` with `default-features = false` and use the keystore API must add `features = ["keystore"]`. `starknet-rust` always enables it. Crates that do not use keystores can now drop `eth-keystore` and the dependencies it pulls in (`aes` 0.8, `scrypt` 0.10, `pbkdf2` 0.11, `uuid` 0.8, `thiserror` 1, and others) ([#170]).
 - **Breaking:** Removed the redundant sequencer-specific `BlockId` in `starknet-rust-providers`. The sequencer gateway provider now uses the canonical `starknet_rust_core::types::BlockId` throughout ([#154]).
 - **Breaking:** `LegacyContractClass.abi` type changed from `Vec<RawLegacyAbiEntry>` to `Option<Vec<RawLegacyAbiEntry>>` to preserve the `abi: null` vs `abi: []` distinction when computing Cairo 0 hinted class hashes ([#148]).
 - `StarknetError` display messages now use the JSON-RPC error message instead of the Rust variant name, and string error data is formatted without debug quotes ([#160]).
 - **Breaking:** `JsonRpcResponse`'s response `id` changed from `u64` to `Option<u64>`. A `null` or string `id`, which some servers return for errors raised before the request id is read, now deserializes to `None` and surfaces the server's error message instead of failing with a generic deserialization error ([#159]).
 - **Breaking:** `JsonRpcClient::batch_requests` now surfaces the server's error when a batch is rejected as a whole (returned as a single JSON-RPC error object per the spec, e.g. exceeding the server's batch-size limit) instead of failing with a generic deserialization error; adds a `BatchError` variant to the transport error enums ([#163]).
+- **Breaking:** `eth-keystore` is now an optional dependency of `starknet-rust-signers`, behind a new `keystore` feature that is enabled by default. `SigningKey::from_keystore`, `SigningKey::save_as_keystore`, and `KeystoreError` require this feature. Crates that disable default features must enable `keystore` to use the keystore API. Crates that do not use keystores can now drop `eth-keystore` ([#170]).
 
 ### Fixed
 
