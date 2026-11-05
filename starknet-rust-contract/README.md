@@ -18,3 +18,7 @@ to bound nested zero-sized values.
 Cairo 0 ABIs, signed integers, fixed arrays and nested event-enum _struct members_ are currently
 unsupported. Nested/flat enum routing from the selected root is supported. This API does not
 subscribe to events or generate compile-time Rust event types.
+
+Event value types are validated independently of event data, including inside empty arrays/Span
+and all struct fields/enum variants. Named type cycles are visited once during schema validation;
+finite values still obey the runtime depth and aggregate-node limits.

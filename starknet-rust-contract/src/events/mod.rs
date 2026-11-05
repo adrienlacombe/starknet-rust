@@ -328,6 +328,16 @@ mod tests {
         }
     }
     #[test]
+    fn empty_event_arrays_do_not_hide_unsupported_element_types() {
+        let decoder = EventDecoder::from_json(r#"[{"type":"event","name":"Changed","inputs":[{"name":"items","type":"core::array::Array::<Unknown>"}]}]"#, "Changed").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("Changed").unwrap()],
+            data: vec![Felt::ZERO],
+        };
+        assert!(decoder.decode(&event).is_err());
+    }
+    #[test]
     fn cairo1_untyped_event() {
         let d=EventDecoder::from_json(r#"[{"type":"event","name":"old::Changed","inputs":[{"name":"value","type":"core::felt252"}]}]"#,"old::Changed").unwrap();
         let e = Event {

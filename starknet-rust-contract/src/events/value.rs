@@ -44,7 +44,58 @@ impl EventTypes {
         ty: &str,
         data: &mut &[Felt],
     ) -> Result<EventValue, EventDecodeError> {
+        self.validate_type(ty)?;
         self.decode(ty, data, 0, &mut 1_000_000)
+    }
+    // Validate the schema independently of values, so empty arrays and unselected enum
+    // variants cannot hide unsupported types. Each type is visited once, allowing recursive
+    // named schemas without revisiting cycles; value depth/node limits still apply separately.
+    fn validate_type(&self, ty: &str) -> Result<(), EventDecodeError> {
+        self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0)
+    }
+    fn validate_type_graph(
+        &self,
+        ty: &str,
+        seen: &mut std::collections::BTreeSet<String>,
+        depth: usize,
+    ) -> Result<(), EventDecodeError> {
+        if depth > 64 {
+            return Err(error("ABI type nesting exceeds 64"));
+        }
+        let ty = ty.trim();
+        if !seen.insert(ty.to_owned()) {
+            return Ok(());
+        }
+        if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
+            return Ok(());
+        }
+        if let Some(inner) = array_inner(ty) {
+            return self.validate_type_graph(inner, seen, depth + 1);
+        }
+        if let Some(types) = tuple_types(ty)? {
+            for ty in types {
+                self.validate_type_graph(ty, seen, depth + 1)?;
+            }
+            return Ok(());
+        }
+        for entry in &self.entries {
+            match entry {
+                AbiEntry::Struct(s) if s.name == ty => {
+                    for member in &s.members {
+                        self.validate_type_graph(&member.r#type, seen, depth + 1)?;
+                    }
+                    return Ok(());
+                }
+                AbiEntry::Enum(e) if e.name == ty => {
+                    for variant in &e.variants {
+                        self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(error(format!("unsupported type: {ty}")))
     }
     fn decode(
         &self,
@@ -222,6 +273,42 @@ fn length(value: Felt) -> Result<usize, EventDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_array_schema_validation_handles_cycles_and_all_siblings() {
+        let entries = serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"Unknown"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"Unknown"}]}]"#).unwrap();
+        let types = EventTypes { entries };
+        for ty in [
+            "core::array::Array::<Unknown>",
+            "core::array::Span::<Unknown>",
+            "core::array::Array::<core::array::Array::<Unknown>>",
+            "core::array::Array::<(core::felt252, Unknown)>",
+            "core::array::Array::<Node>",
+            "core::array::Span::<Choice>",
+        ] {
+            assert!(
+                types
+                    .decode_value(ty, &mut [Felt::ZERO].as_slice())
+                    .is_err(),
+                "{ty}"
+            );
+        }
+        let types = EventTypes { entries: serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"core::felt252"}]}]"#).unwrap() };
+        assert_eq!(
+            types
+                .decode_value("core::array::Array::<Node>", &mut [Felt::ZERO].as_slice())
+                .unwrap(),
+            EventValue::Sequence(vec![])
+        );
+        assert_eq!(
+            types
+                .decode_value("Node", &mut [Felt::ZERO, Felt::THREE].as_slice())
+                .unwrap(),
+            EventValue::Struct(BTreeMap::from([
+                ("children".into(), EventValue::Sequence(vec![])),
+                ("value".into(), EventValue::Felt(Felt::THREE))
+            ]))
+        );
+    }
     #[test]
     fn aggregate_budget_bounds_nested_zero_sized_values() {
         let types = EventTypes { entries: vec![] };
