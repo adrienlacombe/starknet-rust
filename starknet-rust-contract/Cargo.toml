@@ -19,6 +19,8 @@ starknet-rust-accounts = { workspace = true, features = ["std"] }
 serde_json.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+serde.workspace = true
 starknet-rust-signers.workspace = true
 tokio = { workspace = true, features = ["full"] }
 test-common.workspace = true
