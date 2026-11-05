@@ -17,4 +17,5 @@ This API does not generate compile-time Rust bindings. Cairo 0 ABIs, signed inte
 and Cairo wrapper types not declared as structs/enums in the ABI are currently unsupported and
 return `AbiError`. It rejects unknown functions, wrong arguments, invalid scalars, truncated and
 trailing return data. Recursive value decoding has a depth limit of 64 and arrays a one-million
-item limit; only load ABIs you intend to interact with.
+item limit, with a shared one-million-node decoded-value budget to bound zero-sized nested arrays;
+only load ABIs you intend to interact with.

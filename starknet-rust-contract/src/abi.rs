@@ -106,11 +106,12 @@ impl ContractAbi {
     /// Decodes all outputs, rejecting truncated and trailing return data.
     pub fn decode_outputs(&self, name: &str, data: &[Felt]) -> Result<Vec<AbiValue>, AbiError> {
         let mut data = data;
+        let mut budget = 1_000_000;
         let values = self
             .function(name)?
             .outputs
             .iter()
-            .map(|o| self.decode(&o.r#type, &mut data, 0))
+            .map(|o| self.decode(&o.r#type, &mut data, 0, &mut budget))
             .collect::<Result<_, _>>()?;
         if !data.is_empty() {
             return Err(error("trailing return data"));
@@ -125,7 +126,7 @@ impl ContractAbi {
     }
     /// Decodes a standalone ABI type, consuming only the required prefix.
     pub fn decode_value(&self, ty: &str, data: &mut &[Felt]) -> Result<AbiValue, AbiError> {
-        self.decode(ty, data, 0)
+        self.decode(ty, data, 0, &mut 1_000_000)
     }
     fn encode(
         &self,
@@ -220,7 +221,16 @@ impl ContractAbi {
         }
         Err(error(format!("wrong value for {ty}")))
     }
-    fn decode(&self, ty: &str, data: &mut &[Felt], depth: usize) -> Result<AbiValue, AbiError> {
+    fn decode(
+        &self,
+        ty: &str,
+        data: &mut &[Felt],
+        depth: usize,
+        budget: &mut usize,
+    ) -> Result<AbiValue, AbiError> {
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| error("decoded values exceed one million nodes"))?;
         if depth > 64 {
             return Err(error("ABI nesting exceeds 64"));
         }
@@ -265,14 +275,14 @@ impl ContractAbi {
             }
             let mut values = Vec::new();
             for _ in 0..n {
-                values.push(self.decode(inner, data, depth + 1)?);
+                values.push(self.decode(inner, data, depth + 1, budget)?);
             }
             return Ok(AbiValue::Sequence(values));
         }
         if let Some(types) = tuple_types(ty)? {
             return types
                 .iter()
-                .map(|t| self.decode(t, data, depth + 1))
+                .map(|t| self.decode(t, data, depth + 1, budget))
                 .collect::<Result<Vec<_>, _>>()
                 .map(AbiValue::Sequence);
         }
@@ -281,7 +291,10 @@ impl ContractAbi {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut values = BTreeMap::new();
                     for m in &s.members {
-                        values.insert(m.name.clone(), self.decode(&m.r#type, data, depth + 1)?);
+                        values.insert(
+                            m.name.clone(),
+                            self.decode(&m.r#type, data, depth + 1, budget)?,
+                        );
                     }
                     return Ok(AbiValue::Struct(values));
                 }
@@ -293,7 +306,7 @@ impl ContractAbi {
                         .ok_or_else(|| error("invalid enum discriminant"))?;
                     return Ok(AbiValue::Enum {
                         variant: v.name.clone(),
-                        value: Box::new(self.decode(&v.r#type, data, depth + 1)?),
+                        value: Box::new(self.decode(&v.r#type, data, depth + 1, budget)?),
                     });
                 }
                 _ => {}
@@ -577,6 +590,20 @@ mod tests {
             value: Box::new(AbiValue::Sequence(vec![])),
         };
         assert_eq!(a.encode_value("Choice", &v).unwrap(), vec![Felt::ZERO]);
+    }
+    #[test]
+    fn aggregate_budget_bounds_nested_zero_sized_array_expansion() {
+        let a = abi();
+        let data = [Felt::TWO, Felt::from(6u8), Felt::from(6u8)];
+        assert!(
+            a.decode(
+                "core::array::Array::<core::array::Array::<()>>",
+                &mut data.as_slice(),
+                0,
+                &mut 10
+            )
+            .is_err()
+        );
     }
     #[test]
     fn rejects_invalid_data() {
