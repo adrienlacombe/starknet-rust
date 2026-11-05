@@ -14,6 +14,6 @@ ordinary ABI structs/enums and ByteArray. Unknown selectors, ambiguous/cyclic ro
 scalars, truncation and trailing keys/data fail explicitly. Depth is limited to 64; arrays are
 limited to one million items.
 
-Cairo 0 ABIs, signed integers, fixed arrays and nested event-enum *struct members* are currently
+Cairo 0 ABIs, signed integers, fixed arrays and nested event-enum _struct members_ are currently
 unsupported. Nested/flat enum routing from the selected root is supported. This API does not
 subscribe to events or generate compile-time Rust event types.
