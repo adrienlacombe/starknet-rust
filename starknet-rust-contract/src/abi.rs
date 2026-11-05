@@ -153,7 +153,12 @@ impl ContractAbi {
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
-        if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
+        if scalar_bits(ty).is_some()
+            || matches!(
+                ty,
+                "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
+            )
+        {
             return Ok(());
         }
         if let Some(inner) = array_inner(ty) {
@@ -207,6 +212,19 @@ impl ContractAbi {
             if let AbiValue::Felt(f) = value {
                 validate_scalar(ty, *f)?;
                 out.push(*f);
+                return Ok(());
+            }
+        } else if ty == "core::integer::u256" {
+            if let AbiValue::Struct(fields) = value {
+                if fields.len() != 2 {
+                    return Err(error("u256 requires low and high limbs"));
+                }
+                for name in ["low", "high"] {
+                    let limb = fields
+                        .get(name)
+                        .ok_or_else(|| error("u256 requires low and high limbs"))?;
+                    self.encode("core::integer::u128", limb, out, depth + 1)?;
+                }
                 return Ok(());
             }
         } else if ty == "core::bool" {
@@ -303,6 +321,16 @@ impl ContractAbi {
             let f = take(data)?;
             validate_scalar(ty, f)?;
             return Ok(AbiValue::Felt(f));
+        }
+        if ty == "core::integer::u256" {
+            let mut fields = BTreeMap::new();
+            for name in ["low", "high"] {
+                fields.insert(
+                    name.to_owned(),
+                    self.decode("core::integer::u128", data, depth + 1, budget)?,
+                );
+            }
+            return Ok(AbiValue::Struct(fields));
         }
         if ty == "core::bool" {
             return match take(data)? {
@@ -619,6 +647,45 @@ mod tests {
     }
     fn abi() -> ContractAbi {
         ContractAbi::from_json(r#"[{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"core::integer::u256"}]},{"type":"interface","name":"I","items":[{"type":"function","name":"transfer","inputs":[{"name":"to","type":"core::starknet::contract_address::ContractAddress"},{"name":"amount","type":"core::integer::u256"}],"outputs":[{"type":"core::bool"}],"state_mutability":"external"}]}]"#).unwrap()
+    }
+    #[test]
+    fn builtin_u256_roundtrips_without_an_abi_struct_declaration() {
+        let abi = ContractAbi::from_json("[]").unwrap();
+        let limbs = [Felt::from(u128::MAX), Felt::ONE];
+        let value = AbiValue::Struct(BTreeMap::from([
+            ("low".into(), AbiValue::Felt(limbs[0])),
+            ("high".into(), AbiValue::Felt(limbs[1])),
+        ]));
+        assert_eq!(
+            abi.encode_value("core::integer::u256", &value).unwrap(),
+            limbs
+        );
+        assert_eq!(
+            abi.decode_value("core::integer::u256", &mut limbs.as_slice())
+                .unwrap(),
+            value
+        );
+        for index in [0, 1] {
+            let mut bad = limbs;
+            bad[index] = Felt::from(u128::MAX) + Felt::ONE;
+            assert!(
+                abi.decode_value("core::integer::u256", &mut bad.as_slice())
+                    .is_err()
+            );
+            let bad_value = AbiValue::Struct(BTreeMap::from([
+                ("low".into(), AbiValue::Felt(bad[0])),
+                ("high".into(), AbiValue::Felt(bad[1])),
+            ]));
+            assert!(abi.encode_value("core::integer::u256", &bad_value).is_err());
+        }
+        assert!(
+            abi.decode_value("core::integer::u256", &mut &limbs[..1])
+                .is_err()
+        );
+        assert!(
+            abi.encode_value("core::integer::u256", &AbiValue::Struct(BTreeMap::new()))
+                .is_err()
+        );
     }
     #[test]
     fn contract_populates_u256_in_cairo_order() {
