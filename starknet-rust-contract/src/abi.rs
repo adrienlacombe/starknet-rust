@@ -99,6 +99,7 @@ impl ContractAbi {
         }
         let mut output = vec![];
         for (field, value) in function.inputs.iter().zip(values) {
+            self.validate_type(&field.r#type)?;
             self.encode(&field.r#type, value, &mut output, 0)?;
         }
         Ok(output)
@@ -111,7 +112,10 @@ impl ContractAbi {
             .function(name)?
             .outputs
             .iter()
-            .map(|o| self.decode(&o.r#type, &mut data, 0, &mut budget))
+            .map(|o| {
+                self.validate_type(&o.r#type)?;
+                self.decode(&o.r#type, &mut data, 0, &mut budget)
+            })
             .collect::<Result<_, _>>()?;
         if !data.is_empty() {
             return Err(error("trailing return data"));
@@ -120,13 +124,65 @@ impl ContractAbi {
     }
     /// Serializes a standalone ABI type.
     pub fn encode_value(&self, ty: &str, value: &AbiValue) -> Result<Vec<Felt>, AbiError> {
+        self.validate_type(ty)?;
         let mut out = vec![];
         self.encode(ty, value, &mut out, 0)?;
         Ok(out)
     }
     /// Decodes a standalone ABI type, consuming only the required prefix.
     pub fn decode_value(&self, ty: &str, data: &mut &[Felt]) -> Result<AbiValue, AbiError> {
+        self.validate_type(ty)?;
         self.decode(ty, data, 0, &mut 1_000_000)
+    }
+    // Validate the schema independently of values, so empty arrays and unselected enum
+    // variants cannot hide unsupported types. Each type is visited once, allowing recursive
+    // named schemas without revisiting cycles; value depth/node limits still apply separately.
+    fn validate_type(&self, ty: &str) -> Result<(), AbiError> {
+        self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0)
+    }
+    fn validate_type_graph(
+        &self,
+        ty: &str,
+        seen: &mut std::collections::BTreeSet<String>,
+        depth: usize,
+    ) -> Result<(), AbiError> {
+        if depth > 64 {
+            return Err(error("ABI type nesting exceeds 64"));
+        }
+        let ty = ty.trim();
+        if !seen.insert(ty.to_owned()) {
+            return Ok(());
+        }
+        if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
+            return Ok(());
+        }
+        if let Some(inner) = array_inner(ty) {
+            return self.validate_type_graph(inner, seen, depth + 1);
+        }
+        if let Some(types) = tuple_types(ty)? {
+            for ty in types {
+                self.validate_type_graph(ty, seen, depth + 1)?;
+            }
+            return Ok(());
+        }
+        for entry in &self.entries {
+            match entry {
+                AbiEntry::Struct(s) if s.name == ty => {
+                    for member in &s.members {
+                        self.validate_type_graph(&member.r#type, seen, depth + 1)?;
+                    }
+                    return Ok(());
+                }
+                AbiEntry::Enum(e) if e.name == ty => {
+                    for variant in &e.variants {
+                        self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        Err(error(format!("unsupported type: {ty}")))
     }
     fn encode(
         &self,
@@ -590,6 +646,82 @@ mod tests {
             value: Box::new(AbiValue::Sequence(vec![])),
         };
         assert_eq!(a.encode_value("Choice", &v).unwrap(), vec![Felt::ZERO]);
+    }
+    #[test]
+    fn empty_arrays_and_spans_validate_their_complete_element_schema() {
+        let a = abi();
+        for ty in [
+            "core::array::Array::<Unknown>",
+            "core::array::Span::<Unknown>",
+            "core::array::Array::<core::array::Array::<Unknown>>",
+            "core::array::Array::<(core::felt252, Unknown)>",
+            "core::array::Array::<core::integer::i128>",
+        ] {
+            assert!(
+                a.encode_value(ty, &AbiValue::Sequence(vec![])).is_err(),
+                "{ty}"
+            );
+            assert!(
+                a.decode_value(ty, &mut [Felt::ZERO].as_slice()).is_err(),
+                "{ty}"
+            );
+        }
+        for ty in [
+            "core::array::Array::<core::felt252>",
+            "core::array::Span::<core::felt252>",
+        ] {
+            assert_eq!(
+                a.encode_value(ty, &AbiValue::Sequence(vec![])).unwrap(),
+                vec![Felt::ZERO]
+            );
+            assert_eq!(
+                a.decode_value(ty, &mut [Felt::ZERO].as_slice()).unwrap(),
+                AbiValue::Sequence(vec![])
+            );
+        }
+        let function = ContractAbi::from_json(r#"[{"type":"function","name":"f","inputs":[{"name":"items","type":"core::array::Array::<Unknown>"}],"outputs":[{"type":"core::array::Span::<Unknown>"}],"state_mutability":"view"}]"#).unwrap();
+        assert!(
+            function
+                .encode_inputs("f", &[AbiValue::Sequence(vec![])])
+                .is_err()
+        );
+        assert!(function.decode_outputs("f", &[Felt::ZERO]).is_err());
+    }
+    #[test]
+    fn recursive_type_validation_checks_all_sibling_fields_and_enum_variants() {
+        let valid = ContractAbi::from_json(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"core::felt252"}]}]"#).unwrap();
+        let node = AbiValue::Struct(BTreeMap::from([
+            ("children".into(), AbiValue::Sequence(vec![])),
+            ("value".into(), AbiValue::Felt(Felt::THREE)),
+        ]));
+        assert_eq!(
+            valid.encode_value("Node", &node).unwrap(),
+            vec![Felt::ZERO, Felt::THREE]
+        );
+        assert_eq!(
+            valid
+                .decode_value("Node", &mut [Felt::ZERO, Felt::THREE].as_slice())
+                .unwrap(),
+            node
+        );
+        let invalid = ContractAbi::from_json(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"Unknown"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"Unknown"}]}]"#).unwrap();
+        for ty in ["core::array::Array::<Node>", "core::array::Span::<Choice>"] {
+            assert!(
+                invalid
+                    .encode_value(ty, &AbiValue::Sequence(vec![]))
+                    .is_err()
+            );
+            assert!(
+                invalid
+                    .decode_value(ty, &mut [Felt::ZERO].as_slice())
+                    .is_err()
+            );
+        }
+        let empty_variant = AbiValue::Enum {
+            variant: "None".into(),
+            value: Box::new(AbiValue::Sequence(vec![])),
+        };
+        assert!(invalid.encode_value("Choice", &empty_variant).is_err());
     }
     #[test]
     fn aggregate_budget_bounds_nested_zero_sized_array_expansion() {
