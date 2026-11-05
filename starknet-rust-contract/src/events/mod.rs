@@ -90,6 +90,7 @@ impl EventDecoder {
             },
             vec![],
             &mut vec![],
+            &mut 4096,
         )?;
         let mut paths = BTreeSet::new();
         if decoder
@@ -124,7 +125,11 @@ impl EventDecoder {
         selectors: Vec<Felt>,
         path: Vec<String>,
         stack: &mut Vec<String>,
+        budget: &mut usize,
     ) -> Result<(), EventDecodeError> {
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| error("event ABI traversal exceeds 4096 nodes"))?;
         if self.routes.len() >= 4096 {
             return Err(error("event ABI exceeds 4096 routes"));
         }
@@ -143,7 +148,7 @@ impl EventDecoder {
                     }
                     let mut path = path.clone();
                     path.push(v.name);
-                    self.routes(&v.r#type, selectors, path, stack)?;
+                    self.routes(&v.r#type, selectors, path, stack, budget)?;
                 }
             }
             _ => self.routes.push(Route {
