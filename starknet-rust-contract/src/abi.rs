@@ -584,7 +584,7 @@ mod tests {
         let encoded = a.encode_value(ty, &v).unwrap();
         let mut input = encoded.as_slice();
         assert_eq!(a.decode_value(ty, &mut input).unwrap(), v);
-        assert!(input.is_empty());
+        assert_eq!(input, []);
         let v = AbiValue::Enum {
             variant: "None".into(),
             value: Box::new(AbiValue::Sequence(vec![])),
