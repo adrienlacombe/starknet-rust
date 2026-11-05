@@ -44,14 +44,18 @@ impl EventTypes {
         ty: &str,
         data: &mut &[Felt],
     ) -> Result<EventValue, EventDecodeError> {
-        self.decode(ty, data, 0)
+        self.decode(ty, data, 0, &mut 1_000_000)
     }
     fn decode(
         &self,
         ty: &str,
         data: &mut &[Felt],
         depth: usize,
+        budget: &mut usize,
     ) -> Result<EventValue, EventDecodeError> {
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| error("decoded values exceed one million nodes"))?;
         if depth > 64 {
             return Err(error("ABI nesting exceeds 64"));
         }
@@ -96,14 +100,14 @@ impl EventTypes {
             }
             let mut values = Vec::new();
             for _ in 0..n {
-                values.push(self.decode(inner, data, depth + 1)?);
+                values.push(self.decode(inner, data, depth + 1, budget)?);
             }
             return Ok(EventValue::Sequence(values));
         }
         if let Some(types) = tuple_types(ty)? {
             return types
                 .iter()
-                .map(|t| self.decode(t, data, depth + 1))
+                .map(|t| self.decode(t, data, depth + 1, budget))
                 .collect::<Result<Vec<_>, _>>()
                 .map(EventValue::Sequence);
         }
@@ -112,7 +116,10 @@ impl EventTypes {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut values = BTreeMap::new();
                     for m in &s.members {
-                        values.insert(m.name.clone(), self.decode(&m.r#type, data, depth + 1)?);
+                        values.insert(
+                            m.name.clone(),
+                            self.decode(&m.r#type, data, depth + 1, budget)?,
+                        );
                     }
                     return Ok(EventValue::Struct(values));
                 }
@@ -124,7 +131,7 @@ impl EventTypes {
                         .ok_or_else(|| error("invalid enum discriminant"))?;
                     return Ok(EventValue::Enum {
                         variant: v.name.clone(),
-                        value: Box::new(self.decode(&v.r#type, data, depth + 1)?),
+                        value: Box::new(self.decode(&v.r#type, data, depth + 1, budget)?),
                     });
                 }
                 _ => {}
@@ -210,4 +217,24 @@ fn take(data: &mut &[Felt]) -> Result<Felt, EventDecodeError> {
 }
 fn length(value: Felt) -> Result<usize, EventDecodeError> {
     usize::try_from(value).map_err(|_| error("length or discriminant does not fit usize"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn aggregate_budget_bounds_nested_zero_sized_values() {
+        let types = EventTypes { entries: vec![] };
+        let data = [Felt::TWO, Felt::from(6u8), Felt::from(6u8)];
+        assert!(
+            types
+                .decode(
+                    "core::array::Array::<core::array::Array::<()>>",
+                    &mut data.as_slice(),
+                    0,
+                    &mut 10
+                )
+                .is_err()
+        );
+    }
 }

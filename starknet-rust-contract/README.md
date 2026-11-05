@@ -12,7 +12,8 @@ are decoded from their respective streams. Cairo 1 untyped events use their shor
 The value decoder supports felts, unsigned integer/address widths, bool, arrays/Span, tuples,
 ordinary ABI structs/enums and ByteArray. Unknown selectors, ambiguous/cyclic routes, invalid
 scalars, truncation and trailing keys/data fail explicitly. Depth is limited to 64; arrays are
-limited to one million items.
+limited to one million items, with a shared one-million-node budget per decoded field value tree
+to bound nested zero-sized values.
 
 Cairo 0 ABIs, signed integers, fixed arrays and nested event-enum _struct members_ are currently
 unsupported. Nested/flat enum routing from the selected root is supported. This API does not
