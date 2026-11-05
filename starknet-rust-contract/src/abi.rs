@@ -26,7 +26,7 @@ pub enum AbiValue {
         /// Variant payload.
         value: Box<Self>,
     },
-    /// Cairo ByteArray bytes, which need not be UTF-8.
+    /// Cairo `ByteArray` bytes, which need not be UTF-8.
     Bytes(Vec<u8>),
 }
 
@@ -69,10 +69,10 @@ impl ContractAbi {
                 AbiEntry::Enum(e) => Some((1, &e.name)),
                 _ => None,
             };
-            if let Some(name) = name {
-                if !names.insert(name) {
-                    return Err(error("duplicate ABI name"));
-                }
+            if let Some(name) = name
+                && !names.insert(name)
+            {
+                return Err(error("duplicate ABI name"));
             }
         }
         Ok(Self { entries: flattened })
