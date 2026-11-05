@@ -10,3 +10,6 @@
 
 mod factory;
 pub use factory::{ContractFactory, DeploymentV3, UdcSelector};
+
+/// ABI-driven Cairo event decoding.
+pub mod events;
