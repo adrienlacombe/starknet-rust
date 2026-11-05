@@ -67,10 +67,10 @@ impl EventDecoder {
                 AbiEntry::Enum(e) => Some(e.name.as_str()),
                 _ => None,
             };
-            if let Some(name) = name {
-                if !names.insert(name) {
-                    return Err(error("duplicate event/type name"));
-                }
+            if let Some(name) = name
+                && !names.insert(name)
+            {
+                return Err(error("duplicate event/type name"));
             }
         }
         let mut decoder = Self {
@@ -162,15 +162,16 @@ impl EventDecoder {
             if event.keys.starts_with(&route.selectors) {
                 let mut keys = &event.keys[route.selectors.len()..];
                 let mut data = event.data.as_slice();
-                if let Ok(fields) = self.fields(&route.ty, &mut keys, &mut data, 0) {
-                    if keys.is_empty() && data.is_empty() {
-                        matches.push(DecodedEvent {
-                            from_address: event.from_address,
-                            path: route.path.clone(),
-                            event_type: route.ty.clone(),
-                            fields,
-                        });
-                    }
+                if let Ok(fields) = self.fields(&route.ty, &mut keys, &mut data, 0)
+                    && keys.is_empty()
+                    && data.is_empty()
+                {
+                    matches.push(DecodedEvent {
+                        from_address: event.from_address,
+                        path: route.path.clone(),
+                        event_type: route.ty.clone(),
+                        fields,
+                    });
                 }
             }
         }

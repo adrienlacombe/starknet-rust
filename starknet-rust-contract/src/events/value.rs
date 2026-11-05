@@ -18,7 +18,7 @@ pub enum EventValue {
         /// Variant payload.
         value: Box<Self>,
     },
-    /// Cairo ByteArray bytes, which need not be UTF-8.
+    /// Cairo `ByteArray` bytes, which need not be UTF-8.
     Bytes(Vec<u8>),
 }
 
