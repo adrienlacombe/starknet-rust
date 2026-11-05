@@ -168,13 +168,21 @@ impl ContractAbi {
         for entry in &self.entries {
             match entry {
                 AbiEntry::Struct(s) if s.name == ty => {
+                    let mut names = std::collections::BTreeSet::new();
                     for member in &s.members {
+                        if !names.insert(&member.name) {
+                            return Err(error("duplicate ABI struct member"));
+                        }
                         self.validate_type_graph(&member.r#type, seen, depth + 1)?;
                     }
                     return Ok(());
                 }
                 AbiEntry::Enum(e) if e.name == ty => {
+                    let mut names = std::collections::BTreeSet::new();
                     for variant in &e.variants {
+                        if !names.insert(&variant.name) {
+                            return Err(error("duplicate ABI enum variant"));
+                        }
                         self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
                     }
                     return Ok(());
@@ -722,6 +730,30 @@ mod tests {
             value: Box::new(AbiValue::Sequence(vec![])),
         };
         assert!(invalid.encode_value("Choice", &empty_variant).is_err());
+    }
+    #[test]
+    fn duplicate_struct_members_never_produce_a_lossy_success() {
+        let a = ContractAbi::from_json(r#"[{"type":"struct","name":"Bad","members":[{"name":"x","type":"core::integer::u8"},{"name":"x","type":"core::integer::u8"}]},{"type":"function","name":"f","inputs":[],"outputs":[{"type":"Bad"}],"state_mutability":"view"},{"type":"enum","name":"BadEnum","variants":[{"name":"A","type":"core::integer::u8"},{"name":"A","type":"core::integer::u8"}]}]"#).unwrap();
+        let data = [Felt::ONE, Felt::TWO];
+        let mut input = data.as_slice();
+        assert!(a.decode_value("Bad", &mut input).is_err());
+        assert_eq!(input, data.as_slice());
+        assert!(a.decode_outputs("f", &data).is_err());
+        assert!(a.decode_value("BadEnum", &mut data.as_slice()).is_err());
+        assert!(
+            a.encode_value(
+                "BadEnum",
+                &AbiValue::Enum {
+                    variant: "A".into(),
+                    value: Box::new(AbiValue::Felt(Felt::TWO))
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            a.encode_value("core::array::Array::<Bad>", &AbiValue::Sequence(vec![]))
+                .is_err()
+        );
     }
     #[test]
     fn aggregate_budget_bounds_nested_zero_sized_array_expansion() {

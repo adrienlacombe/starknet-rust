@@ -23,3 +23,6 @@ only load ABIs you intend to interact with.
 Schema validation runs independently of values, so empty arrays/Span and unselected enum variants
 cannot hide unsupported types. Recursive named schemas are checked once per type, including all
 fields/variants; runtime value depth and aggregate-node limits still apply.
+
+Duplicate ordinary struct-member or enum-variant names are rejected during schema validation,
+preventing lossy or ambiguous decoded values.
