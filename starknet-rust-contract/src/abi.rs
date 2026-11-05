@@ -152,11 +152,10 @@ impl ContractAbi {
         } else if ty == "core::byte_array::ByteArray" {
             if let AbiValue::Bytes(bytes) = value {
                 out.push(Felt::from(bytes.len() / 31));
-                let mut chunks = bytes.chunks_exact(31);
-                for c in &mut chunks {
+                let (chunks, tail) = bytes.as_chunks::<31>();
+                for c in chunks {
                     out.push(Felt::from_bytes_be_slice(c));
                 }
-                let tail = chunks.remainder();
                 out.push(Felt::from_bytes_be_slice(tail));
                 out.push(Felt::from(tail.len()));
                 return Ok(());
