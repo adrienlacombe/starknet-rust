@@ -9,7 +9,7 @@ use starknet_rust_core::{
 use std::collections::{BTreeMap, BTreeSet};
 mod value;
 pub use value::{EventDecodeError, EventValue};
-use value::{EventTypes, error};
+use value::{EventTypes, charge_node, error};
 
 /// A decoded event with its ABI path and named fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,9 +31,10 @@ struct Route {
 }
 /// A decoder constructed for a specific contract's root event type.
 ///
-/// Select the Cairo 2 `Event` enum by its fully qualified ABI name. For an untyped Cairo 1 event
-/// or a stand-alone typed struct, the first key is its short-name selector. Cairo 0 ABIs are not
-/// accepted. Unsupported value types return an error, never an unvalidated raw fallback.
+/// Select the Cairo 2 `Event` enum by its fully qualified ABI name. Only untyped Cairo 1 events
+/// start with their short-name selector. Typed struct roots serialize just their members; enum
+/// variants supply nested selectors. Cairo 0 ABIs are not accepted. Unsupported value types return
+/// an error, never an unvalidated raw fallback.
 pub struct EventDecoder {
     types: EventTypes,
     routes: Vec<Route>,
@@ -77,16 +78,13 @@ impl EventDecoder {
             types,
             routes: vec![],
         };
-        let is_enum = matches!(
-            decoder.event(root)?,
-            AbiEvent::Typed(TypedAbiEvent::Enum(_))
-        );
+        let is_untyped = matches!(decoder.event(root)?, AbiEvent::Untyped(_));
         decoder.routes(
             root,
-            if is_enum {
-                vec![]
-            } else {
+            if is_untyped {
                 vec![selector(short_name(root))?]
+            } else {
+                vec![]
             },
             vec![],
             &mut vec![],
@@ -162,15 +160,24 @@ impl EventDecoder {
     }
     /// Decodes an event, rejecting unknown selectors, truncation and trailing keys/data.
     pub fn decode(&self, event: &Event) -> Result<DecodedEvent, EventDecodeError> {
+        self.decode_with_budget(event, &mut 1_000_000)
+    }
+    fn decode_with_budget(
+        &self,
+        event: &Event,
+        budget: &mut usize,
+    ) -> Result<DecodedEvent, EventDecodeError> {
         let mut matches = vec![];
         for route in &self.routes {
             if event.keys.starts_with(&route.selectors) {
                 let mut keys = &event.keys[route.selectors.len()..];
                 let mut data = event.data.as_slice();
-                if let Ok(fields) = self.fields(&route.ty, &mut keys, &mut data, 0)
-                    && keys.is_empty()
-                    && data.is_empty()
-                {
+                let fields = match self.fields(&route.ty, &mut keys, &mut data, 0, budget) {
+                    Ok(fields) => fields,
+                    Err(error) if *budget == 0 => return Err(error),
+                    Err(_) => continue,
+                };
+                if keys.is_empty() && data.is_empty() {
                     matches.push(DecodedEvent {
                         from_address: event.from_address,
                         path: route.path.clone(),
@@ -204,7 +211,9 @@ impl EventDecoder {
         keys: &mut &[Felt],
         data: &mut &[Felt],
         depth: usize,
+        budget: &mut usize,
     ) -> Result<BTreeMap<String, EventValue>, EventDecodeError> {
+        charge_node(budget)?;
         if depth > 64 {
             return Err(error("event nesting exceeds 64"));
         }
@@ -213,7 +222,10 @@ impl EventDecoder {
             AbiEvent::Untyped(e) => {
                 for m in &e.inputs {
                     if fields
-                        .insert(m.name.clone(), self.types.decode_value(&m.r#type, data)?)
+                        .insert(
+                            m.name.clone(),
+                            self.types.decode_value(&m.r#type, data, budget)?,
+                        )
                         .is_some()
                     {
                         return Err(error("duplicate event member"));
@@ -223,20 +235,11 @@ impl EventDecoder {
             AbiEvent::Typed(TypedAbiEvent::Struct(e)) => {
                 for m in &e.members {
                     let value = match m.kind {
-                        EventFieldKind::Key => self.types.decode_value(&m.r#type, keys)?,
-                        EventFieldKind::Data => self.types.decode_value(&m.r#type, data)?,
-                        EventFieldKind::Nested | EventFieldKind::Flat => {
-                            if matches!(m.kind, EventFieldKind::Nested) {
-                                let (head, tail) = keys
-                                    .split_first()
-                                    .ok_or_else(|| error("missing nested event selector"))?;
-                                if *head != selector(&m.name)? {
-                                    return Err(error("wrong nested event selector"));
-                                }
-                                *keys = tail;
-                            }
-                            EventValue::Struct(self.fields(&m.r#type, keys, data, depth + 1)?)
-                        }
+                        EventFieldKind::Key => self.types.decode_value(&m.r#type, keys, budget)?,
+                        EventFieldKind::Data => self.types.decode_value(&m.r#type, data, budget)?,
+                        EventFieldKind::Nested | EventFieldKind::Flat => EventValue::Struct(
+                            self.fields(&m.r#type, keys, data, depth + 1, budget)?,
+                        ),
                     };
                     if fields.insert(m.name.clone(), value).is_some() {
                         return Err(error("duplicate event member"));
@@ -334,6 +337,108 @@ mod tests {
             from_address: Felt::ONE,
             keys: vec![selector("Changed").unwrap()],
             data: vec![Felt::ZERO],
+        };
+        assert!(decoder.decode(&event).is_err());
+    }
+    #[test]
+    fn typed_struct_roots_emit_members_without_a_type_name_selector() {
+        let decoder = EventDecoder::from_json(r#"[{"type":"event","name":"app::Changed","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"data"}]}]"#, "app::Changed").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![],
+            data: vec![Felt::THREE],
+        };
+        assert_eq!(
+            decoder.decode(&event).unwrap().fields["value"],
+            EventValue::Felt(Felt::THREE)
+        );
+        let decoder = EventDecoder::from_json(r#"[{"type":"event","name":"app::Changed","kind":"struct","members":[{"name":"owner","type":"core::felt252","kind":"key"},{"name":"value","type":"core::felt252","kind":"data"}]}]"#, "app::Changed").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![Felt::TWO],
+            data: vec![Felt::THREE],
+        };
+        let output = decoder.decode(&event).unwrap();
+        assert_eq!(output.fields["owner"], EventValue::Felt(Felt::TWO));
+        assert_eq!(output.fields["value"], EventValue::Felt(Felt::THREE));
+        let extra_prefix = Event {
+            keys: vec![selector("Changed").unwrap(), Felt::TWO],
+            ..event
+        };
+        assert!(decoder.decode(&extra_prefix).is_err());
+    }
+    #[test]
+    fn nested_and_flat_event_struct_fields_delegate_without_member_selectors() {
+        for kind in ["nested", "flat"] {
+            let abi = format!(
+                r#"[{{"type":"event","name":"Outer","kind":"struct","members":[{{"name":"inner","type":"Inner","kind":"{kind}"}},{{"name":"outer_key","type":"core::felt252","kind":"key"}}]}},{{"type":"event","name":"Inner","kind":"struct","members":[{{"name":"id","type":"core::felt252","kind":"key"}},{{"name":"value","type":"core::felt252","kind":"data"}}]}}]"#
+            );
+            let decoder = EventDecoder::from_json(&abi, "Outer").unwrap();
+            let event = Event {
+                from_address: Felt::ONE,
+                keys: vec![Felt::from(11u8), Felt::from(22u8)],
+                data: vec![Felt::from(33u8)],
+            };
+            let output = decoder.decode(&event).unwrap();
+            assert_eq!(
+                output.fields["inner"],
+                EventValue::Struct(BTreeMap::from([
+                    ("id".into(), EventValue::Felt(Felt::from(11u8))),
+                    ("value".into(), EventValue::Felt(Felt::from(33u8)))
+                ]))
+            );
+            assert_eq!(
+                output.fields["outer_key"],
+                EventValue::Felt(Felt::from(22u8))
+            );
+        }
+    }
+    #[test]
+    fn one_budget_bounds_recursive_empty_event_maps_and_ordinary_values() {
+        let mut entries = vec![];
+        for depth in 0..6 {
+            let members = if depth == 5 {
+                vec![]
+            } else {
+                ["left", "right"].map(|name| serde_json::json!({"name":name,"type":format!("Node{}", depth+1),"kind":"flat"})).to_vec()
+            };
+            entries.push(serde_json::json!({"type":"event","name":format!("Node{depth}"),"kind":"struct","members":members}));
+        }
+        let decoder = EventDecoder::new(
+            serde_json::from_value(serde_json::Value::Array(entries)).unwrap(),
+            "Node0",
+        )
+        .unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![],
+            data: vec![],
+        };
+        let mut budget = 15;
+        assert!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .0
+                .contains("node budget")
+        );
+        assert_eq!(budget, 0);
+        assert!(decoder.decode_with_budget(&event, &mut 63).is_ok());
+        let decoder = EventDecoder::from_json(r#"[{"type":"event","name":"Outer","kind":"struct","members":[{"name":"inner","type":"Inner","kind":"flat"},{"name":"items","type":"core::array::Array::<()>","kind":"data"}]},{"type":"event","name":"Inner","kind":"struct","members":[]}]"#, "Outer").unwrap();
+        let event = Event {
+            data: vec![Felt::ONE],
+            ..event
+        };
+        assert!(decoder.decode_with_budget(&event, &mut 3).is_err());
+        assert!(decoder.decode_with_budget(&event, &mut 4).is_ok());
+    }
+    #[test]
+    fn ordinary_duplicate_struct_fields_cannot_be_decoded_as_a_valid_event() {
+        let decoder = EventDecoder::from_json(r#"[{"type":"struct","name":"Bad","members":[{"name":"x","type":"core::integer::u8"},{"name":"x","type":"core::integer::u8"}]},{"type":"event","name":"Root","kind":"struct","members":[{"name":"payload","type":"Bad","kind":"data"}]}]"#, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![],
+            data: vec![Felt::ONE, Felt::TWO],
         };
         assert!(decoder.decode(&event).is_err());
     }

@@ -35,6 +35,13 @@ pub(super) fn error(message: impl Into<String>) -> EventDecodeError {
     EventDecodeError(message.into())
 }
 
+pub(super) fn charge_node(budget: &mut usize) -> Result<(), EventDecodeError> {
+    *budget = budget
+        .checked_sub(1)
+        .ok_or_else(|| error("decoded values exceed node budget"))?;
+    Ok(())
+}
+
 pub(super) struct EventTypes {
     pub(super) entries: Vec<AbiEntry>,
 }
@@ -43,9 +50,10 @@ impl EventTypes {
         &self,
         ty: &str,
         data: &mut &[Felt],
+        budget: &mut usize,
     ) -> Result<EventValue, EventDecodeError> {
         self.validate_type(ty)?;
-        self.decode(ty, data, 0, &mut 1_000_000)
+        self.decode(ty, data, 0, budget)
     }
     // Validate the schema independently of values, so empty arrays and unselected enum
     // variants cannot hide unsupported types. Each type is visited once, allowing recursive
@@ -81,13 +89,21 @@ impl EventTypes {
         for entry in &self.entries {
             match entry {
                 AbiEntry::Struct(s) if s.name == ty => {
+                    let mut names = std::collections::BTreeSet::new();
                     for member in &s.members {
+                        if !names.insert(&member.name) {
+                            return Err(error("duplicate ABI struct member"));
+                        }
                         self.validate_type_graph(&member.r#type, seen, depth + 1)?;
                     }
                     return Ok(());
                 }
                 AbiEntry::Enum(e) if e.name == ty => {
+                    let mut names = std::collections::BTreeSet::new();
                     for variant in &e.variants {
+                        if !names.insert(&variant.name) {
+                            return Err(error("duplicate ABI enum variant"));
+                        }
                         self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
                     }
                     return Ok(());
@@ -104,9 +120,7 @@ impl EventTypes {
         depth: usize,
         budget: &mut usize,
     ) -> Result<EventValue, EventDecodeError> {
-        *budget = budget
-            .checked_sub(1)
-            .ok_or_else(|| error("decoded values exceed one million nodes"))?;
+        charge_node(budget)?;
         if depth > 64 {
             return Err(error("ABI nesting exceeds 64"));
         }
@@ -287,7 +301,7 @@ mod tests {
         ] {
             assert!(
                 types
-                    .decode_value(ty, &mut [Felt::ZERO].as_slice())
+                    .decode_value(ty, &mut [Felt::ZERO].as_slice(), &mut 1_000_000)
                     .is_err(),
                 "{ty}"
             );
@@ -295,18 +309,39 @@ mod tests {
         let types = EventTypes { entries: serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"core::felt252"}]}]"#).unwrap() };
         assert_eq!(
             types
-                .decode_value("core::array::Array::<Node>", &mut [Felt::ZERO].as_slice())
+                .decode_value(
+                    "core::array::Array::<Node>",
+                    &mut [Felt::ZERO].as_slice(),
+                    &mut 1_000_000
+                )
                 .unwrap(),
             EventValue::Sequence(vec![])
         );
         assert_eq!(
             types
-                .decode_value("Node", &mut [Felt::ZERO, Felt::THREE].as_slice())
+                .decode_value(
+                    "Node",
+                    &mut [Felt::ZERO, Felt::THREE].as_slice(),
+                    &mut 1_000_000
+                )
                 .unwrap(),
             EventValue::Struct(BTreeMap::from([
                 ("children".into(), EventValue::Sequence(vec![])),
                 ("value".into(), EventValue::Felt(Felt::THREE))
             ]))
+        );
+    }
+    #[test]
+    fn duplicate_ordinary_struct_fields_are_rejected_before_consuming_values() {
+        let types = EventTypes { entries: serde_json::from_str(r#"[{"type":"struct","name":"Bad","members":[{"name":"x","type":"core::integer::u8"},{"name":"x","type":"core::integer::u8"}]},{"type":"enum","name":"BadEnum","variants":[{"name":"A","type":"core::integer::u8"},{"name":"A","type":"core::integer::u8"}]}]"#).unwrap() };
+        let data = [Felt::ONE, Felt::TWO];
+        let mut input = data.as_slice();
+        assert!(types.decode_value("Bad", &mut input, &mut 100).is_err());
+        assert_eq!(input, data.as_slice());
+        assert!(
+            types
+                .decode_value("BadEnum", &mut data.as_slice(), &mut 100)
+                .is_err()
         );
     }
     #[test]
