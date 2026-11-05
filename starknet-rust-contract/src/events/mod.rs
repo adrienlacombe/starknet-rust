@@ -4,7 +4,7 @@ use starknet_rust_core::{
         Event, Felt,
         contract::{AbiEntry, AbiEvent, EventFieldKind, TypedAbiEvent},
     },
-    utils::get_selector_from_name,
+    utils::starknet_keccak,
 };
 use std::collections::{BTreeMap, BTreeSet};
 mod value;
@@ -60,18 +60,17 @@ impl EventDecoder {
         let mut flat = vec![];
         flatten(entries, &mut flat);
         let types = EventTypes { entries: flat };
-        let mut names = BTreeSet::new();
-        for e in &types.entries {
-            let name = match e {
-                AbiEntry::Event(e) => Some(event_name(e)),
-                AbiEntry::Struct(s) => Some(s.name.as_str()),
-                AbiEntry::Enum(e) => Some(e.name.as_str()),
-                _ => None,
+        let mut event_names = BTreeSet::new();
+        let mut type_names = BTreeSet::new();
+        for entry in &types.entries {
+            let (names, name) = match entry {
+                AbiEntry::Event(e) => (&mut event_names, event_name(e)),
+                AbiEntry::Struct(s) => (&mut type_names, s.name.as_str()),
+                AbiEntry::Enum(e) => (&mut type_names, e.name.as_str()),
+                _ => continue,
             };
-            if let Some(name) = name
-                && !names.insert(name)
-            {
-                return Err(error("duplicate event/type name"));
+            if !names.insert(name) {
+                return Err(error("duplicate event or ordinary type name"));
             }
         }
         let mut decoder = Self {
@@ -259,7 +258,11 @@ fn short_name(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
 fn selector(name: &str) -> Result<Felt, EventDecodeError> {
-    get_selector_from_name(name).map_err(|e| error(e.to_string()))
+    if !name.is_ascii() {
+        return Err(error("event selector name must be ASCII"));
+    }
+    // Event selector! hashes even names reserved for default entrypoints.
+    Ok(starknet_keccak(name.as_bytes()))
 }
 fn event_name(e: &AbiEvent) -> &str {
     match e {
@@ -274,6 +277,80 @@ mod tests {
     use super::*;
     const ABI: &str = r#"[{"type":"event","name":"app::Event","kind":"enum","variants":[{"name":"Token","type":"erc20::Event","kind":"flat"},{"name":"Paused","type":"app::Paused","kind":"nested"}]},{"type":"event","name":"erc20::Event","kind":"enum","variants":[{"name":"Transfer","type":"erc20::Transfer","kind":"nested"}]},{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"event","name":"erc20::Transfer","kind":"struct","members":[{"name":"from","type":"core::starknet::contract_address::ContractAddress","kind":"key"},{"name":"to","type":"core::starknet::contract_address::ContractAddress","kind":"key"},{"name":"amount","type":"core::integer::u256","kind":"data"}]},{"type":"event","name":"app::Paused","kind":"struct","members":[{"name":"paused","type":"core::bool","kind":"data"}]}]"#;
     #[test]
+    fn event_and_ordinary_types_have_separate_namespaces() {
+        let abi = r#"[{"type":"event","name":"Shared","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"data"}]},{"type":"struct","name":"Shared","members":[{"name":"value","type":"core::felt252"}]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Shared").unwrap();
+        let result = decoder
+            .decode(&Event {
+                from_address: Felt::ONE,
+                keys: vec![],
+                data: vec![Felt::TWO],
+            })
+            .unwrap();
+        assert_eq!(result.fields["value"], EventValue::Felt(Felt::TWO));
+        let mut entries: Vec<AbiEntry> = serde_json::from_str(abi).unwrap();
+        entries.push(entries[0].clone());
+        assert!(EventDecoder::new(entries, "Shared").is_err());
+    }
+    #[test]
+    fn default_like_event_variants_hash_their_names() {
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"__default__","type":"Empty","kind":"nested"},{"name":"__l1_default__","type":"Empty","kind":"nested"}]},{"type":"event","name":"Empty","kind":"struct","members":[]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        for name in ["__default__", "__l1_default__"] {
+            let hash = starknet_keccak(name.as_bytes());
+            assert_ne!(hash, Felt::ZERO);
+            let result = decoder
+                .decode(&Event {
+                    from_address: Felt::ONE,
+                    keys: vec![hash],
+                    data: vec![],
+                })
+                .unwrap();
+            assert_eq!(result.path, vec![name.to_owned()]);
+        }
+        assert!(
+            decoder
+                .decode(&Event {
+                    from_address: Felt::ONE,
+                    keys: vec![Felt::ZERO],
+                    data: vec![]
+                })
+                .is_err()
+        );
+    }
+    #[test]
+    fn cairo1_erc20_fixture_decodes_builtin_u256_without_a_struct_entry() {
+        let artifact: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../starknet-rust-core/test-data/contracts/cairo1/artifacts/erc20_sierra.txt"
+        ))
+        .unwrap();
+        let entries: Vec<AbiEntry> = serde_json::from_value(artifact["abi"].clone()).unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e, AbiEntry::Struct(s) if s.name == "core::integer::u256"))
+        );
+        let decoder = EventDecoder::new(entries, "Transfer").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![starknet_keccak(b"Transfer")],
+            data: vec![Felt::TWO, Felt::THREE, Felt::from(u128::MAX), Felt::ONE],
+        };
+        let value = decoder.decode(&event).unwrap();
+        assert_eq!(
+            value.fields["value"],
+            EventValue::Struct(BTreeMap::from([
+                ("low".into(), EventValue::Felt(Felt::from(u128::MAX))),
+                ("high".into(), EventValue::Felt(Felt::ONE))
+            ]))
+        );
+        for limb in [2, 3] {
+            let mut invalid = event.clone();
+            invalid.data[limb] = Felt::from(u128::MAX) + Felt::ONE;
+            assert!(decoder.decode(&invalid).is_err());
+        }
+    }
+    #[test]
     fn nested_flat_paths_and_struct_values() {
         let d = EventDecoder::from_json(ABI, "app::Event").unwrap();
         let e = Event {
@@ -281,11 +358,11 @@ mod tests {
             keys: vec![selector("Transfer").unwrap(), Felt::TWO, Felt::THREE],
             data: vec![Felt::ONE, Felt::ZERO],
         };
-        let decoded = d.decode(&e).unwrap();
-        assert_eq!(decoded.path, vec!["Token", "Transfer"]);
-        assert_eq!(decoded.fields["from"], EventValue::Felt(Felt::TWO));
+        let result = d.decode(&e).unwrap();
+        assert_eq!(result.path, vec!["Token", "Transfer"]);
+        assert_eq!(result.fields["from"], EventValue::Felt(Felt::TWO));
         assert_eq!(
-            decoded.fields["amount"],
+            result.fields["amount"],
             EventValue::Struct(BTreeMap::from([
                 ("low".into(), EventValue::Felt(Felt::ONE)),
                 ("high".into(), EventValue::Felt(Felt::ZERO))

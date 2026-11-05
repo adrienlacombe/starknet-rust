@@ -74,7 +74,12 @@ impl EventTypes {
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
-        if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
+        if scalar_bits(ty).is_some()
+            || matches!(
+                ty,
+                "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
+            )
+        {
             return Ok(());
         }
         if let Some(inner) = array_inner(ty) {
@@ -129,6 +134,16 @@ impl EventTypes {
             let f = take(data)?;
             validate_scalar(ty, f)?;
             return Ok(EventValue::Felt(f));
+        }
+        if ty == "core::integer::u256" {
+            let mut fields = BTreeMap::new();
+            for name in ["low", "high"] {
+                fields.insert(
+                    name.to_owned(),
+                    self.decode("core::integer::u128", data, depth + 1, budget)?,
+                );
+            }
+            return Ok(EventValue::Struct(fields));
         }
         if ty == "core::bool" {
             return match take(data)? {
