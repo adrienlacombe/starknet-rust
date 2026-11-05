@@ -47,9 +47,11 @@ fn error(message: impl Into<String>) -> AbiError {
 #[derive(Debug, Clone)]
 pub struct ContractAbi {
     entries: Vec<AbiEntry>,
+    type_indices: BTreeMap<String, usize>,
+    function_indices: BTreeMap<String, usize>,
 }
 impl ContractAbi {
-    /// Creates an ABI, expanding interface entries. Duplicate function/type names are rejected.
+    /// Creates an ABI, expanding interface entries. Duplicates within the function namespace or ordinary type namespace are rejected; functions and types may share a name.
     pub fn new(entries: Vec<AbiEntry>) -> Result<Self, AbiError> {
         fn flatten(entries: Vec<AbiEntry>, out: &mut Vec<AbiEntry>) {
             for e in entries {
@@ -62,20 +64,32 @@ impl ContractAbi {
         let mut flattened = vec![];
         flatten(entries, &mut flattened);
         let mut names = std::collections::BTreeSet::new();
-        for e in &flattened {
+        let mut type_indices = BTreeMap::new();
+        let mut function_indices = BTreeMap::new();
+        for (index, e) in flattened.iter().enumerate() {
             let name = match e {
                 AbiEntry::Function(f) => Some((0, &f.name)),
                 AbiEntry::Struct(s) => Some((1, &s.name)),
                 AbiEntry::Enum(e) => Some((1, &e.name)),
                 _ => None,
             };
-            if let Some(name) = name
-                && !names.insert(name)
-            {
-                return Err(error("duplicate ABI name"));
+            if let Some((namespace, name)) = name {
+                if !names.insert((namespace, name)) {
+                    return Err(error("duplicate ABI name"));
+                }
+                let indices = if namespace == 0 {
+                    &mut function_indices
+                } else {
+                    &mut type_indices
+                };
+                indices.insert(name.clone(), index);
             }
         }
-        Ok(Self { entries: flattened })
+        Ok(Self {
+            entries: flattened,
+            type_indices,
+            function_indices,
+        })
     }
     /// Parses a Cairo 1 ABI JSON array.
     pub fn from_json(json: &str) -> Result<Self, AbiError> {
@@ -83,10 +97,10 @@ impl ContractAbi {
     }
     /// Looks up a function, including functions declared in interfaces.
     pub fn function(&self, name: &str) -> Result<&AbiFunction, AbiError> {
-        self.entries
-            .iter()
-            .find_map(|e| match e {
-                AbiEntry::Function(f) if f.name == name => Some(f),
+        self.function_indices
+            .get(name)
+            .and_then(|index| match &self.entries[*index] {
+                AbiEntry::Function(function) => Some(function),
                 _ => None,
             })
             .ok_or_else(|| error(format!("unknown function: {name}")))
@@ -95,7 +109,11 @@ impl ContractAbi {
     pub fn encode_inputs(&self, name: &str, values: &[AbiValue]) -> Result<Vec<Felt>, AbiError> {
         let function = self.function(name)?;
         if function.inputs.len() != values.len() {
-            return Err(error("wrong argument count"));
+            return Err(error(format!(
+                "wrong argument count for {name}: expected {}, got {}",
+                function.inputs.len(),
+                values.len()
+            )));
         }
         let mut output = vec![];
         for (field, value) in function.inputs.iter().zip(values) {
@@ -170,7 +188,7 @@ impl ContractAbi {
             }
             return Ok(());
         }
-        for entry in &self.entries {
+        if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
             match entry {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut names = std::collections::BTreeSet::new();
@@ -262,7 +280,7 @@ impl ContractAbi {
                 return Ok(());
             }
         } else {
-            for entry in &self.entries {
+            if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
                 match entry {
                     AbiEntry::Struct(s) if s.name == ty => {
                         if let AbiValue::Struct(fields) = value {
@@ -378,7 +396,7 @@ impl ContractAbi {
                 .collect::<Result<Vec<_>, _>>()
                 .map(AbiValue::Sequence);
         }
-        for entry in &self.entries {
+        if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
             match entry {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut values = BTreeMap::new();
@@ -647,6 +665,28 @@ mod tests {
     }
     fn abi() -> ContractAbi {
         ContractAbi::from_json(r#"[{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"core::integer::u256"}]},{"type":"interface","name":"I","items":[{"type":"function","name":"transfer","inputs":[{"name":"to","type":"core::starknet::contract_address::ContractAddress"},{"name":"amount","type":"core::integer::u256"}],"outputs":[{"type":"core::bool"}],"state_mutability":"external"}]}]"#).unwrap()
+    }
+    #[test]
+    fn indexed_function_and_type_namespaces_can_overlap() {
+        let abi = ContractAbi::from_json(r#"[{"type":"struct","name":"Shared","members":[{"name":"value","type":"core::felt252"}]},{"type":"function","name":"Shared","inputs":[{"name":"value","type":"Shared"}],"outputs":[{"type":"Shared"}],"state_mutability":"view"}]"#).unwrap();
+        let value = AbiValue::Struct(BTreeMap::from([(
+            "value".into(),
+            AbiValue::Felt(Felt::THREE),
+        )]));
+        assert_eq!(
+            abi.encode_inputs("Shared", std::slice::from_ref(&value))
+                .unwrap(),
+            vec![Felt::THREE]
+        );
+        assert_eq!(
+            abi.decode_outputs("Shared", &[Felt::THREE]).unwrap(),
+            vec![value]
+        );
+        let message = abi.encode_inputs("Shared", &[]).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            "wrong argument count for Shared: expected 1, got 0"
+        );
     }
     #[test]
     fn builtin_u256_roundtrips_without_an_abi_struct_declaration() {
