@@ -977,7 +977,7 @@ mod tests {
             "core::felt252",
         ] {
             let malformed = serde_json::json!({"type":"struct","name":ty,"members":[{"name":"bad","type":"Unknown"}]});
-            let json = serde_json::json!([malformed.clone()]).to_string();
+            let json = serde_json::json!([malformed]).to_string();
             let codec = ContractAbi::from_json(&json).unwrap();
             assert_eq!(
                 codec
