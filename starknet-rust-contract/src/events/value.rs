@@ -305,10 +305,14 @@ impl EventTypes {
             return Ok(EventValue::Bytes(bytes));
         }
         if let Some(inner) = array_inner(ty) {
-            let n = length(take(data)?)?; // Bound work even for zero-sized types.
-            if n > 1_000_000 {
+            // Compare before host-sized conversion so every above-cap count,
+            // including lengths beyond usize on native/WASM, is a terminal resource abort.
+            let count = take(data)?;
+            if count > Felt::from(1_000_000u64) {
+                budget.exceeded = true;
                 return Err(error("array exceeds one million items"));
             }
+            let n = length(count)?;
             let mut values = Vec::new();
             for _ in 0..n {
                 values.push(self.decode(inner, data, depth + 1, budget)?);

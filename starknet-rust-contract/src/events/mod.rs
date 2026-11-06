@@ -671,6 +671,29 @@ mod tests {
         );
     }
     #[test]
+    fn oversized_array_is_terminal_after_an_earlier_matching_candidate() {
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"selector","type":"core::felt252","kind":"key"},{"name":"value","type":"core::felt252","kind":"data"}]},{"type":"event","name":"B","kind":"struct","members":[{"name":"values","type":"core::array::Array::<()>","kind":"data"}]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        for count in [Felt::from(1_000_001u64), Felt::MAX] {
+            let event = Event {
+                from_address: Felt::ONE,
+                keys: vec![selector("B").unwrap()],
+                data: vec![count],
+            };
+            let mut budget = NodeBudget::new(1_000_000);
+            assert_eq!(
+                decoder
+                    .decode_with_budget(&event, &mut budget)
+                    .unwrap_err()
+                    .to_string(),
+                "array exceeds one million items"
+            );
+            assert!(budget.exceeded);
+            // A completed before B reached the cap; its match must not hide B's exhaustion.
+            assert_eq!(budget.remaining, 999_995);
+        }
+    }
+    #[test]
     fn exact_budget_boundary_does_not_turn_schema_failure_into_exhaustion() {
         let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"key"}]},{"type":"event","name":"B","kind":"struct","members":[{"name":"value","type":"Unknown","kind":"data"}]}]"#;
         let decoder = EventDecoder::from_json(abi, "Root").unwrap();

@@ -32,3 +32,6 @@ shared across all roots, event candidates and matching events in `decode_from`. 
 budget even for empty arrays; completed root validations are cached. Exceptionally complex cold
 schemas may hit this resource cap. Exhaustion is never cached as an invalid schema and event
 decoding stops on exhaustion even if an earlier candidate matched.
+
+Array counts above one million are terminal resource exhaustion, including counts too large for
+the native or WASM host integer size; an earlier matching candidate cannot hide this abort.
