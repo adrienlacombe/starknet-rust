@@ -167,6 +167,7 @@ impl EventDecoder {
         budget: &mut usize,
     ) -> Result<DecodedEvent, EventDecodeError> {
         let mut matches = vec![];
+        let mut candidate_error = None;
         for route in &self.routes {
             if event.keys.starts_with(&route.selectors) {
                 let mut keys = &event.keys[route.selectors.len()..];
@@ -174,7 +175,10 @@ impl EventDecoder {
                 let fields = match self.fields(&route.ty, &mut keys, &mut data, 0, budget) {
                     Ok(fields) => fields,
                     Err(error) if *budget == 0 => return Err(error),
-                    Err(_) => continue,
+                    Err(error) => {
+                        candidate_error.get_or_insert(error);
+                        continue;
+                    }
                 };
                 if keys.is_empty() && data.is_empty() {
                     matches.push(DecodedEvent {
@@ -183,12 +187,14 @@ impl EventDecoder {
                         event_type: route.ty.clone(),
                         fields,
                     });
+                } else {
+                    candidate_error.get_or_insert_with(|| error("trailing event keys or data"));
                 }
             }
         }
         match matches.len() {
             1 => Ok(matches.remove(0)),
-            0 => Err(error("unknown selector or malformed event keys/data")),
+            0 => Err(candidate_error.unwrap_or_else(|| error("unknown event selector"))),
             _ => Err(error("ambiguous event")),
         }
     }
@@ -276,6 +282,70 @@ fn event_name(e: &AbiEvent) -> &str {
 mod tests {
     use super::*;
     const ABI: &str = r#"[{"type":"event","name":"app::Event","kind":"enum","variants":[{"name":"Token","type":"erc20::Event","kind":"flat"},{"name":"Paused","type":"app::Paused","kind":"nested"}]},{"type":"event","name":"erc20::Event","kind":"enum","variants":[{"name":"Transfer","type":"erc20::Transfer","kind":"nested"}]},{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"event","name":"erc20::Transfer","kind":"struct","members":[{"name":"from","type":"core::starknet::contract_address::ContractAddress","kind":"key"},{"name":"to","type":"core::starknet::contract_address::ContractAddress","kind":"key"},{"name":"amount","type":"core::integer::u256","kind":"data"}]},{"type":"event","name":"app::Paused","kind":"struct","members":[{"name":"paused","type":"core::bool","kind":"data"}]}]"#;
+    #[test]
+    fn matching_routes_preserve_specific_decode_failures() {
+        for (ty, data, expected) in [
+            ("Unknown", vec![], "unsupported type: Unknown"),
+            (
+                "core::integer::u8",
+                vec![Felt::from(256_u64)],
+                "value out of range for core::integer::u8",
+            ),
+            ("core::integer::u8", vec![], "truncated ABI data"),
+            (
+                "core::integer::u8",
+                vec![Felt::ZERO, Felt::ONE],
+                "trailing event keys or data",
+            ),
+        ] {
+            let abi = serde_json::json!([{"type":"event","name":"Root","kind":"struct","members":[{"name":"value","type":ty,"kind":"data"}]}]);
+            let decoder = EventDecoder::from_json(&abi.to_string(), "Root").unwrap();
+            assert_eq!(
+                decoder
+                    .decode(&Event {
+                        from_address: Felt::ONE,
+                        keys: vec![],
+                        data
+                    })
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        let decoder = EventDecoder::from_json(ABI, "app::Event").unwrap();
+        assert_eq!(
+            decoder
+                .decode(&Event {
+                    from_address: Felt::ONE,
+                    keys: vec![],
+                    data: vec![]
+                })
+                .unwrap_err()
+                .to_string(),
+            "unknown event selector"
+        );
+    }
+    #[test]
+    fn failed_candidates_do_not_hide_successes_or_ambiguity() {
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"data"}]},{"type":"event","name":"B","kind":"struct","members":[]}]"#;
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap()],
+            data: vec![],
+        };
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        assert_eq!(decoder.decode(&event).unwrap().path, vec!["B"]);
+        // The flat candidate now consumes B's selector as its key, so both routes succeed.
+        let decoder = EventDecoder::from_json(
+            &abi.replace("\"kind\":\"data\"", "\"kind\":\"key\""),
+            "Root",
+        )
+        .unwrap();
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "ambiguous event"
+        );
+    }
     #[test]
     fn event_and_ordinary_types_have_separate_namespaces() {
         let abi = r#"[{"type":"event","name":"Shared","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"data"}]},{"type":"struct","name":"Shared","members":[{"name":"value","type":"core::felt252"}]}]"#;
