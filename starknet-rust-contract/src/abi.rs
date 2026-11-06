@@ -260,15 +260,38 @@ impl ContractAbi {
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
-        // Builtin wire encodings do not exempt an explicit ABI declaration from
-        // duplicate-name and nested-type validation.
-        if !self.type_indices.contains_key(ty)
-            && (scalar_bits(ty).is_some()
-                || matches!(
-                    ty,
-                    "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
-                ))
-        {
+        // Every explicit declaration is checked before any wire-syntax shortcut.
+        // The wire form is still checked afterwards: a declared Array/tuple cannot
+        // hide unsupported implicit element types by supplying an empty struct.
+        let declared = match self.type_indices.get(ty).map(|index| &self.entries[*index]) {
+            Some(AbiEntry::Struct(definition)) => {
+                let mut names = std::collections::BTreeSet::new();
+                for member in &definition.members {
+                    if !names.insert(&member.name) {
+                        return Err(error("duplicate ABI struct member"));
+                    }
+                    self.validate_type_graph(&member.r#type, seen, depth + 1)?;
+                }
+                true
+            }
+            Some(AbiEntry::Enum(definition)) => {
+                let mut names = std::collections::BTreeSet::new();
+                for variant in &definition.variants {
+                    if !names.insert(&variant.name) {
+                        return Err(error("duplicate ABI enum variant"));
+                    }
+                    self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
+                }
+                true
+            }
+            _ => false,
+        };
+        if ty == "core::integer::u256" {
+            // The builtin codec recursively uses this named limb type even when
+            // the ABI omits a u256 declaration.
+            return self.validate_type_graph("core::integer::u128", seen, depth + 1);
+        }
+        if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
             return Ok(());
         }
         if let Some(inner) = array_inner(ty) {
@@ -280,32 +303,11 @@ impl ContractAbi {
             }
             return Ok(());
         }
-        if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
-            match entry {
-                AbiEntry::Struct(s) if s.name == ty => {
-                    let mut names = std::collections::BTreeSet::new();
-                    for member in &s.members {
-                        if !names.insert(&member.name) {
-                            return Err(error("duplicate ABI struct member"));
-                        }
-                        self.validate_type_graph(&member.r#type, seen, depth + 1)?;
-                    }
-                    return Ok(());
-                }
-                AbiEntry::Enum(e) if e.name == ty => {
-                    let mut names = std::collections::BTreeSet::new();
-                    for variant in &e.variants {
-                        if !names.insert(&variant.name) {
-                            return Err(error("duplicate ABI enum variant"));
-                        }
-                        self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
+        if declared {
+            Ok(())
+        } else {
+            Err(error(format!("unsupported type: {ty}")))
         }
-        Err(error(format!("unsupported type: {ty}")))
     }
     fn encode(
         &self,
@@ -1010,6 +1012,48 @@ mod tests {
         }
     }
     #[test]
+    fn explicit_array_span_tuple_and_unit_declarations_cannot_bypass_schema_checks() {
+        let cases = [
+            (
+                "core::array::Array::<core::felt252>",
+                AbiValue::Sequence(vec![]),
+            ),
+            (
+                "core::array::Span::<core::felt252>",
+                AbiValue::Sequence(vec![]),
+            ),
+            (
+                "(core::felt252, core::bool)",
+                AbiValue::Sequence(vec![AbiValue::Felt(Felt::ZERO), AbiValue::Bool(false)]),
+            ),
+            ("()", AbiValue::Sequence(vec![])),
+        ];
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(ty, _)| {
+                (
+                    *ty,
+                    Some("duplicate ABI struct member".to_owned()),
+                    Some("duplicate ABI struct member".to_owned()),
+                )
+            })
+            .collect();
+        let mut actual = vec![];
+        for (ty, value) in cases {
+            let abi = ContractAbi::from_json(&serde_json::json!([{"type":"struct","name":ty,"members":[{"name":"same","type":"()"},{"name":"same","type":"()"}]}]).to_string()).unwrap();
+            actual.push((
+                ty,
+                abi.encode_value(ty, &value)
+                    .err()
+                    .map(|error| error.to_string()),
+                abi.decode_value(ty, &mut [Felt::ZERO; 3].as_slice())
+                    .err()
+                    .map(|error| error.to_string()),
+            ));
+        }
+        assert_eq!(actual, expected);
+    }
+    #[test]
     fn contract_populates_u256_in_cairo_order() {
         let c = Contract::new(Felt::THREE, abi(), ());
         let amount = AbiValue::Struct(BTreeMap::from([
@@ -1202,6 +1246,153 @@ mod tests {
                 &mut [Felt::ZERO, Felt::ZERO, Felt::from(32u8)].as_slice()
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn all_special_wire_forms_validate_explicit_declarations_first() {
+        for ty in [
+            "core::felt252",
+            "core::starknet::contract_address::ContractAddress",
+            "core::starknet::class_hash::ClassHash",
+            "core::starknet::storage_access::StorageAddress",
+            "core::integer::u8",
+            "core::integer::u16",
+            "core::integer::u32",
+            "core::integer::u64",
+            "core::integer::u96",
+            "core::integer::u128",
+            "core::bytes_31::bytes31",
+            "core::bool",
+            "core::integer::u256",
+            "core::byte_array::ByteArray",
+            "core::array::Array::<core::felt252>",
+            "core::array::Span::<core::felt252>",
+            "(core::felt252, core::bool)",
+            "()",
+        ] {
+            for (declaration, expected) in [
+                (
+                    serde_json::json!({"type":"struct","name":ty,"members":[{"name":"bad","type":"Unknown"}]}),
+                    "unsupported type: Unknown",
+                ),
+                (
+                    serde_json::json!({"type":"struct","name":ty,"members":[{"name":"same","type":"()"},{"name":"same","type":"()"}]}),
+                    "duplicate ABI struct member",
+                ),
+                (
+                    serde_json::json!({"type":"enum","name":ty,"variants":[{"name":"Same","type":"()"},{"name":"Same","type":"()"}]}),
+                    "duplicate ABI enum variant",
+                ),
+            ] {
+                let decoder =
+                    ContractAbi::from_json(&serde_json::json!([declaration]).to_string()).unwrap();
+                for root in [ty.to_owned(), format!("core::array::Array::<{ty}>")] {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            decoder
+                                .encode_value(&root, &AbiValue::Sequence(vec![]))
+                                .unwrap_err()
+                                .to_string(),
+                            expected
+                        );
+                        let input = [Felt::ZERO; 3];
+                        let mut data = input.as_slice();
+                        assert_eq!(
+                            decoder
+                                .decode_value(&root, &mut data)
+                                .unwrap_err()
+                                .to_string(),
+                            expected,
+                            "{root}"
+                        );
+                        assert_eq!(data, input.as_slice());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn valid_declared_syntactic_forms_keep_their_wire_encodings() {
+        for (ty, value, wire) in [
+            (
+                "core::array::Array::<core::felt252>",
+                AbiValue::Sequence(vec![AbiValue::Felt(Felt::THREE)]),
+                vec![Felt::ONE, Felt::THREE],
+            ),
+            (
+                "core::array::Span::<core::felt252>",
+                AbiValue::Sequence(vec![AbiValue::Felt(Felt::THREE)]),
+                vec![Felt::ONE, Felt::THREE],
+            ),
+            (
+                "(core::felt252, core::bool)",
+                AbiValue::Sequence(vec![AbiValue::Felt(Felt::THREE), AbiValue::Bool(true)]),
+                vec![Felt::THREE, Felt::ONE],
+            ),
+            ("()", AbiValue::Sequence(vec![]), vec![]),
+        ] {
+            let declaration = serde_json::json!({"type":"struct","name":ty,"members":[]});
+            let decoder =
+                ContractAbi::from_json(&serde_json::json!([declaration]).to_string()).unwrap();
+            assert_eq!(decoder.encode_value(ty, &value).unwrap(), wire);
+            let mut data = wire.as_slice();
+            assert_eq!(decoder.decode_value(ty, &mut data).unwrap(), value);
+            assert_eq!(data, [] as [Felt; 0]);
+        }
+    }
+    #[test]
+    fn explicit_syntactic_declarations_also_validate_implicit_wire_elements() {
+        for ty in [
+            "core::array::Array::<Unknown>",
+            "core::array::Span::<Unknown>",
+            "(core::felt252, Unknown)",
+        ] {
+            let declaration = serde_json::json!({"type":"struct","name":ty,"members":[]});
+            let decoder =
+                ContractAbi::from_json(&serde_json::json!([declaration]).to_string()).unwrap();
+            for root in [ty.to_owned(), format!("core::array::Array::<{ty}>")] {
+                assert_eq!(
+                    decoder
+                        .encode_value(&root, &AbiValue::Sequence(vec![]))
+                        .unwrap_err()
+                        .to_string(),
+                    "unsupported type: Unknown"
+                );
+                let input = [Felt::ZERO; 3];
+                let mut data = input.as_slice();
+                assert_eq!(
+                    decoder
+                        .decode_value(&root, &mut data)
+                        .unwrap_err()
+                        .to_string(),
+                    "unsupported type: Unknown"
+                );
+                assert_eq!(data, input.as_slice());
+            }
+        }
+        let declaration = serde_json::json!({"type":"struct","name":"core::integer::u128","members":[{"name":"bad","type":"Unknown"}]});
+        let decoder =
+            ContractAbi::from_json(&serde_json::json!([declaration]).to_string()).unwrap();
+        assert_eq!(
+            decoder
+                .encode_value(
+                    "core::integer::u256",
+                    &AbiValue::Struct(BTreeMap::from([
+                        ("low".into(), AbiValue::Felt(Felt::ZERO)),
+                        ("high".into(), AbiValue::Felt(Felt::ZERO))
+                    ]))
+                )
+                .unwrap_err()
+                .to_string(),
+            "unsupported type: Unknown"
+        );
+        let mut input = [Felt::ZERO; 2].as_slice();
+        assert_eq!(
+            decoder
+                .decode_value("core::integer::u256", &mut input)
+                .unwrap_err()
+                .to_string(),
+            "unsupported type: Unknown"
         );
     }
 }
