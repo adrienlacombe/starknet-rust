@@ -670,6 +670,100 @@ mod tests {
             "ambiguous event"
         );
     }
+    const ORDINARY_ENUM_ABI: &str = r#"[{"type":"struct","name":"Pair","members":[{"name":"amount","type":"core::integer::u16"},{"name":"enabled","type":"core::bool"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"Pair"}]},{"type":"event","name":"Payload","kind":"struct","members":[{"name":"indexed","type":"Choice","kind":"key"},{"name":"values","type":"core::array::Array::<Choice>","kind":"data"},{"name":"tail","type":"core::felt252","kind":"data"}]}]"#;
+    fn ordinary_choice(value: Option<(u16, bool)>) -> EventValue {
+        match value {
+            None => EventValue::Enum {
+                variant: "None".into(),
+                value: Box::new(EventValue::Sequence(vec![])),
+            },
+            Some((amount, enabled)) => EventValue::Enum {
+                variant: "Some".into(),
+                value: Box::new(EventValue::Struct(BTreeMap::from([
+                    ("amount".into(), EventValue::Felt(Felt::from(amount))),
+                    ("enabled".into(), EventValue::Bool(enabled)),
+                ]))),
+            },
+        }
+    }
+    #[test]
+    fn ordinary_enum_fields_decode_unit_and_struct_payloads_in_keys_and_data() {
+        let decoder = EventDecoder::from_json(ORDINARY_ENUM_ABI, "Payload").unwrap();
+        for (keys, data, indexed, values, tail) in [
+            (
+                vec![0u64],
+                vec![2, 0, 1, 42, 1, 99],
+                ordinary_choice(None),
+                vec![ordinary_choice(None), ordinary_choice(Some((42, true)))],
+                99u64,
+            ),
+            (
+                vec![1, 7, 0],
+                vec![1, 0, 77],
+                ordinary_choice(Some((7, false))),
+                vec![ordinary_choice(None)],
+                77,
+            ),
+        ] {
+            let event = Event {
+                from_address: Felt::ONE,
+                keys: keys.into_iter().map(Felt::from).collect(),
+                data: data.into_iter().map(Felt::from).collect(),
+            };
+            // Repeat to exercise completed schema-cache results as well as cold validation.
+            for _ in 0..2 {
+                let output = decoder.decode(&event).unwrap();
+                assert_eq!(output.event_type, "Payload");
+                assert_eq!(output.path, [] as [String; 0]);
+                assert_eq!(
+                    output.fields,
+                    BTreeMap::from([
+                        ("indexed".into(), indexed.clone()),
+                        ("values".into(), EventValue::Sequence(values.clone())),
+                        ("tail".into(), EventValue::Felt(Felt::from(tail))),
+                    ])
+                );
+            }
+        }
+    }
+    #[test]
+    fn ordinary_enum_fields_reject_invalid_discriminants_and_malformed_payloads() {
+        let decoder = EventDecoder::from_json(ORDINARY_ENUM_ABI, "Payload").unwrap();
+        for (data, expected) in [
+            (vec![], "truncated ABI data"),
+            (vec![1u64], "truncated ABI data"),
+            (vec![1, 1], "truncated ABI data"),
+            (vec![1, 1, 42], "truncated ABI data"),
+            (vec![1, 2, 99], "invalid enum discriminant"),
+            (vec![1, 1, 42, 2, 99], "invalid boolean"),
+            (vec![0, 99, 100], "trailing event keys or data"),
+        ] {
+            let event = Event {
+                from_address: Felt::ONE,
+                keys: vec![Felt::ZERO],
+                data: data.into_iter().map(Felt::from).collect(),
+            };
+            assert_eq!(decoder.decode(&event).unwrap_err().to_string(), expected);
+        }
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![Felt::from(2u64)],
+            data: vec![Felt::ZERO, Felt::ONE],
+        };
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "invalid enum discriminant"
+        );
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![Felt::ZERO],
+            data: vec![Felt::ONE, Felt::MAX],
+        };
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "length or discriminant does not fit usize"
+        );
+    }
     #[test]
     fn oversized_array_is_terminal_after_an_earlier_matching_candidate() {
         let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"selector","type":"core::felt252","kind":"key"},{"name":"value","type":"core::felt252","kind":"data"}]},{"type":"event","name":"B","kind":"struct","members":[{"name":"values","type":"core::array::Array::<()>","kind":"data"}]}]"#;
