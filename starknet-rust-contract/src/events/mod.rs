@@ -220,7 +220,7 @@ impl EventDecoder {
         event: &Event,
         budget: &mut NodeBudget,
     ) -> Result<DecodedEvent, EventDecodeError> {
-        let mut matches = vec![];
+        let mut matched = None;
         let mut candidate_error = None;
         for route in &self.routes {
             if event.keys.starts_with(&route.selectors) {
@@ -235,7 +235,10 @@ impl EventDecoder {
                     }
                 };
                 if keys.is_empty() && data.is_empty() {
-                    matches.push(DecodedEvent {
+                    if matched.is_some() {
+                        return Err(error("ambiguous event"));
+                    }
+                    matched = Some(DecodedEvent {
                         from_address: event.from_address,
                         path: route.path.clone(),
                         event_type: route.ty.clone(),
@@ -246,11 +249,7 @@ impl EventDecoder {
                 }
             }
         }
-        match matches.len() {
-            1 => Ok(matches.remove(0)),
-            0 => Err(candidate_error.unwrap_or_else(|| error("unknown event selector"))),
-            _ => Err(error("ambiguous event")),
-        }
+        matched.ok_or_else(|| candidate_error.unwrap_or_else(|| error("unknown event selector")))
     }
     /// Decodes only events emitted by the specified address, preserving receipt order.
     pub fn decode_from(
@@ -874,5 +873,38 @@ mod tests {
     #[test]
     fn detects_cycles() {
         assert!(EventDecoder::from_json(r#"[{"type":"event","name":"E","kind":"enum","variants":[{"name":"E","type":"E","kind":"flat"}]}]"#,"E").is_err());
+    }
+    #[test]
+    fn second_successful_byte_payload_proves_ambiguity_without_retaining_more() {
+        let abi = serde_json::json!([
+            {"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},
+            {"type":"event","name":"A","kind":"struct","members":[{"name":"k1","type":"core::felt252","kind":"key"},{"name":"k2","type":"core::felt252","kind":"key"},{"name":"bytes","type":"core::byte_array::ByteArray","kind":"data"}]},
+            {"type":"event","name":"B","kind":"enum","variants":[{"name":"Flat","type":"Flat","kind":"flat"},{"name":"D","type":"D","kind":"nested"}]},
+            {"type":"event","name":"Flat","kind":"struct","members":[{"name":"key","type":"core::felt252","kind":"key"},{"name":"bytes","type":"core::byte_array::ByteArray","kind":"data"}]},
+            {"type":"event","name":"D","kind":"struct","members":[{"name":"bytes","type":"core::byte_array::ByteArray","kind":"data"}]}
+        ]);
+        let decoder = EventDecoder::from_json(&abi.to_string(), "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap(), selector("D").unwrap()],
+            data: vec![Felt::ONE, Felt::ZERO, Felt::ZERO, Felt::ZERO],
+        };
+        let mut budget = NodeBudget::new(11);
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ambiguous event"
+        );
+        assert_eq!(budget.remaining, 0);
+        assert!(!budget.exceeded);
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut NodeBudget::new(10))
+                .unwrap_err()
+                .to_string(),
+            "decoded values exceed node budget"
+        );
     }
 }
