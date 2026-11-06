@@ -6,7 +6,11 @@ use starknet_rust_core::{
     },
     utils::get_selector_from_name,
 };
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, RwLock},
+};
 
 /// A value described by a Cairo 1 ABI. Integers use canonical field encodings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +53,7 @@ pub struct ContractAbi {
     entries: Vec<AbiEntry>,
     type_indices: BTreeMap<String, usize>,
     function_indices: BTreeMap<String, usize>,
+    schema_results: Arc<RwLock<BTreeMap<String, Result<(), AbiError>>>>,
 }
 impl ContractAbi {
     /// Creates an ABI, expanding interface entries. Duplicates within the function namespace or ordinary type namespace are rejected; functions and types may share a name.
@@ -89,6 +94,7 @@ impl ContractAbi {
             entries: flattened,
             type_indices,
             function_indices,
+            schema_results: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
     /// Parses a Cairo 1 ABI JSON array.
@@ -156,7 +162,21 @@ impl ContractAbi {
     // variants cannot hide unsupported types. Each type is visited once, allowing recursive
     // named schemas without revisiting cycles; value depth/node limits still apply separately.
     fn validate_type(&self, ty: &str) -> Result<(), AbiError> {
-        self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0)
+        let ty = ty.trim();
+        if let Some(result) = self
+            .schema_results
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(ty)
+        {
+            return result.clone();
+        }
+        let result = self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0);
+        self.schema_results
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(ty.to_owned(), result.clone());
+        result
     }
     fn validate_type_graph(
         &self,
@@ -665,6 +685,24 @@ mod tests {
     }
     fn abi() -> ContractAbi {
         ContractAbi::from_json(r#"[{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"core::integer::u256"}]},{"type":"interface","name":"I","items":[{"type":"function","name":"transfer","inputs":[{"name":"to","type":"core::starknet::contract_address::ContractAddress"},{"name":"amount","type":"core::integer::u256"}],"outputs":[{"type":"core::bool"}],"state_mutability":"external"}]}]"#).unwrap()
+    }
+    #[test]
+    fn cached_recursive_schema_errors_remain_errors_after_clone() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ContractAbi>();
+        let abi = ContractAbi::from_json(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"invalid","type":"Unknown"}]}]"#).unwrap();
+        let empty = AbiValue::Sequence(vec![]);
+        for current in [&abi, &abi.clone()] {
+            for ty in ["core::array::Array::<Node>", "Node"] {
+                assert!(current.encode_value(ty, &empty).is_err());
+                assert!(
+                    current
+                        .decode_value(ty, &mut [Felt::ZERO].as_slice())
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(abi.schema_results.read().unwrap().len(), 2);
     }
     #[test]
     fn indexed_function_and_type_namespaces_can_overlap() {
