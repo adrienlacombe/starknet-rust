@@ -47,17 +47,66 @@ fn error(message: impl Into<String>) -> AbiError {
     AbiError(message.into())
 }
 
+#[derive(Debug)]
+struct SchemaCache {
+    results: BTreeMap<String, Result<(), AbiError>>,
+    remaining: usize,
+}
+impl SchemaCache {
+    const fn new() -> Self {
+        Self {
+            results: BTreeMap::new(),
+            remaining: 64 * 1024 * 1024,
+        }
+    }
+    fn cache(
+        &mut self,
+        ty: &str,
+        result: &Result<(), AbiError>,
+        budget: &mut SchemaBudget,
+    ) -> Result<(), AbiError> {
+        // Cache capacity is optional, shared across operations, and accounted under
+        // the same write lock as insertion. Concurrent completed roots never double-charge.
+        if self.results.contains_key(ty) {
+            return Ok(());
+        }
+        let bytes = ty
+            .len()
+            .saturating_add(match result {
+                Ok(()) => 0,
+                Err(failure) => failure.0.len(),
+            })
+            .saturating_add(128);
+        if let Some(remaining) = self.remaining.checked_sub(bytes) {
+            budget.charge_owned(bytes)?;
+            self.results.insert(ty.to_owned(), result.clone());
+            self.remaining = remaining;
+        }
+        Ok(())
+    }
+}
+impl std::ops::Deref for SchemaCache {
+    type Target = BTreeMap<String, Result<(), AbiError>>;
+    fn deref(&self) -> &Self::Target {
+        &self.results
+    }
+}
+
 // Per operation, cold schema traversal is bounded independently of decoded value nodes.
 const DEFAULT_SCHEMA_WORK: usize = 1_000_000;
 struct SchemaBudget {
     remaining: usize,
     exceeded: bool,
+    owned: usize,
+    text: usize,
 }
 impl SchemaBudget {
     const fn new(remaining: usize) -> Self {
         Self {
             remaining,
             exceeded: false,
+            owned: 64 * 1024 * 1024,
+            text: 64 * 1024 * 1024,
         }
     }
     fn charge(&mut self) -> Result<(), AbiError> {
@@ -66,6 +115,23 @@ impl SchemaBudget {
             return Err(error("ABI schema validation exceeds work budget"));
         }
         self.remaining -= 1;
+        Ok(())
+    }
+
+    fn charge_owned(&mut self, count: usize) -> Result<(), AbiError> {
+        let Some(remaining) = self.owned.checked_sub(count) else {
+            self.exceeded = true;
+            return Err(error("ABI logical allocation exceeds byte budget"));
+        };
+        self.owned = remaining;
+        Ok(())
+    }
+    fn charge_text(&mut self, count: usize) -> Result<(), AbiError> {
+        let Some(remaining) = self.text.checked_sub(count) else {
+            self.exceeded = true;
+            return Err(error("ABI type text exceeds work budget"));
+        };
+        self.text = remaining;
         Ok(())
     }
 }
@@ -77,7 +143,7 @@ pub struct ContractAbi {
     type_indices: BTreeMap<String, usize>,
     function_indices: BTreeMap<String, usize>,
     cacheable_types: BTreeSet<String>,
-    schema_results: Arc<RwLock<BTreeMap<String, Result<(), AbiError>>>>,
+    schema_results: Arc<RwLock<SchemaCache>>,
 }
 impl ContractAbi {
     /// Creates an ABI, expanding interface entries. Duplicates within the function namespace or ordinary type namespace are rejected; functions and types may share a name.
@@ -184,7 +250,7 @@ impl ContractAbi {
             type_indices,
             function_indices,
             cacheable_types,
-            schema_results: Arc::new(RwLock::new(BTreeMap::new())),
+            schema_results: Arc::new(RwLock::new(SchemaCache::new())),
         })
     }
     /// Parses a Cairo 1 ABI JSON array.
@@ -215,6 +281,8 @@ impl ContractAbi {
         values: &[AbiValue],
         schema: &mut SchemaBudget,
     ) -> Result<Vec<Felt>, AbiError> {
+        schema.charge_text(name.len())?;
+        schema.charge_owned(name.len())?;
         let function = self.function(name)?;
         if function.inputs.len() != values.len() {
             return Err(error(format!(
@@ -226,7 +294,7 @@ impl ContractAbi {
         let mut output = vec![];
         for (field, value) in function.inputs.iter().zip(values) {
             self.validate_type(&field.r#type, schema)?;
-            self.encode(&field.r#type, value, &mut output, 0)?;
+            self.encode(&field.r#type, value, &mut output, 0, schema)?;
         }
         Ok(output)
     }
@@ -244,6 +312,8 @@ impl ContractAbi {
         data: &[Felt],
         schema: &mut SchemaBudget,
     ) -> Result<Vec<AbiValue>, AbiError> {
+        schema.charge_text(name.len())?;
+        schema.charge_owned(name.len())?;
         let mut data = data;
         let mut budget = 1_000_000;
         let values = self
@@ -252,7 +322,7 @@ impl ContractAbi {
             .iter()
             .map(|o| {
                 self.validate_type(&o.r#type, schema)?;
-                self.decode(&o.r#type, &mut data, 0, &mut budget)
+                self.decode(&o.r#type, &mut data, 0, &mut budget, schema)
             })
             .collect::<Result<_, _>>()?;
         if !data.is_empty() {
@@ -262,21 +332,24 @@ impl ContractAbi {
     }
     /// Serializes a standalone ABI type.
     pub fn encode_value(&self, ty: &str, value: &AbiValue) -> Result<Vec<Felt>, AbiError> {
-        self.validate_type(ty, &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))?;
+        let mut schema = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        self.validate_type(ty, &mut schema)?;
         let mut out = vec![];
-        self.encode(ty, value, &mut out, 0)?;
+        self.encode(ty, value, &mut out, 0, &mut schema)?;
         Ok(out)
     }
     /// Decodes a standalone ABI type, consuming only the required prefix.
     pub fn decode_value(&self, ty: &str, data: &mut &[Felt]) -> Result<AbiValue, AbiError> {
-        self.validate_type(ty, &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))?;
-        self.decode(ty, data, 0, &mut 1_000_000)
+        let mut schema = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        self.validate_type(ty, &mut schema)?;
+        self.decode(ty, data, 0, &mut 1_000_000, &mut schema)
     }
     // Validate the schema independently of values, so empty arrays and unselected enum
     // variants cannot hide unsupported types. Each type is visited once, allowing recursive
     // named schemas without revisiting cycles; value depth/node limits still apply separately.
     fn validate_type(&self, ty: &str, budget: &mut SchemaBudget) -> Result<(), AbiError> {
         budget.charge()?;
+        budget.charge_text(ty.len().saturating_mul(4))?;
         let ty = ty.trim();
         if let Some(result) = self
             .schema_results
@@ -284,6 +357,10 @@ impl ContractAbi {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(ty)
         {
+            if let Err(failure) = result {
+                budget.charge_owned(failure.0.len())?;
+                budget.charge_text(failure.0.len())?;
+            }
             return result.clone();
         }
         let result =
@@ -292,7 +369,7 @@ impl ContractAbi {
             self.schema_results
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(ty.to_owned(), result.clone());
+                .cache(ty, &result, budget)?;
         }
         result
     }
@@ -304,10 +381,16 @@ impl ContractAbi {
         budget: &mut SchemaBudget,
     ) -> Result<(), AbiError> {
         budget.charge()?;
+        budget.charge_text(ty.len().saturating_mul(4))?;
         if depth > 64 {
             return Err(error("ABI type nesting exceeds 64"));
         }
         let ty = ty.trim();
+        budget.charge_owned(
+            ty.len()
+                .saturating_mul(2)
+                .saturating_add(std::mem::size_of::<String>()),
+        )?;
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
@@ -319,6 +402,7 @@ impl ContractAbi {
                 let mut names = std::collections::BTreeSet::new();
                 for member in &definition.members {
                     budget.charge()?;
+                    budget.charge_text(member.name.len())?;
                     if !names.insert(&member.name) {
                         return Err(error("duplicate ABI struct member"));
                     }
@@ -330,6 +414,7 @@ impl ContractAbi {
                 let mut names = std::collections::BTreeSet::new();
                 for variant in &definition.variants {
                     budget.charge()?;
+                    budget.charge_text(variant.name.len())?;
                     if !names.insert(&variant.name) {
                         return Err(error("duplicate ABI enum variant"));
                     }
@@ -377,13 +462,16 @@ impl ContractAbi {
         value: &AbiValue,
         out: &mut Vec<Felt>,
         depth: usize,
+        schema: &mut SchemaBudget,
     ) -> Result<(), AbiError> {
+        schema.charge_text(ty.len().saturating_mul(4))?;
+        schema.charge_owned(ty.len().saturating_add(2 * std::mem::size_of::<Felt>()))?;
         if depth > 64 {
             return Err(error("ABI nesting exceeds 64"));
         }
         let ty = ty.trim();
         if let Some(inner) = ty.strip_prefix('@') {
-            return self.encode(inner, value, out, depth + 1);
+            return self.encode(inner, value, out, depth + 1, schema);
         }
         if scalar_bits(ty).is_some() {
             if let AbiValue::Felt(f) = value {
@@ -400,7 +488,7 @@ impl ContractAbi {
                     let limb = fields
                         .get(name)
                         .ok_or_else(|| error("u256 requires low and high limbs"))?;
-                    self.encode("core::integer::u128", limb, out, depth + 1)?;
+                    self.encode("core::integer::u128", limb, out, depth + 1, schema)?;
                 }
                 return Ok(());
             }
@@ -411,6 +499,11 @@ impl ContractAbi {
             }
         } else if ty == "core::byte_array::ByteArray" {
             if let AbiValue::Bytes(bytes) = value {
+                schema.charge_owned(
+                    (bytes.len() / 31)
+                        .saturating_add(3)
+                        .saturating_mul(2 * std::mem::size_of::<Felt>()),
+                )?;
                 out.push(Felt::from(bytes.len() / 31));
                 let (chunks, tail) = bytes.as_chunks::<31>();
                 for c in chunks {
@@ -424,17 +517,17 @@ impl ContractAbi {
             if let AbiValue::Sequence(vs) = value {
                 out.push(Felt::from(vs.len()));
                 for v in vs {
-                    self.encode(inner, v, out, depth + 1)?;
+                    self.encode(inner, v, out, depth + 1, schema)?;
                 }
                 return Ok(());
             }
         } else if let Some(types) = tuple_types(ty)? {
             if let AbiValue::Sequence(vs) = value {
-                if vs.len() != types.len() {
+                if vs.len() != types.clone().count() {
                     return Err(error("wrong tuple length"));
                 }
-                for (t, v) in types.iter().zip(vs) {
-                    self.encode(t, v, out, depth + 1)?;
+                for (t, v) in types.zip(vs) {
+                    self.encode(t, v, out, depth + 1, schema)?;
                 }
                 return Ok(());
             }
@@ -447,6 +540,8 @@ impl ContractAbi {
                                 return Err(error("wrong struct fields"));
                             }
                             for m in &s.members {
+                                schema.charge_text(m.name.len())?;
+                                schema.charge_owned(m.name.len())?;
                                 self.encode(
                                     &m.r#type,
                                     fields.get(&m.name).ok_or_else(|| {
@@ -454,6 +549,7 @@ impl ContractAbi {
                                     })?,
                                     out,
                                     depth + 1,
+                                    schema,
                                 )?;
                             }
                             return Ok(());
@@ -462,14 +558,19 @@ impl ContractAbi {
                     }
                     AbiEntry::Enum(e) if e.name == ty => {
                         if let AbiValue::Enum { variant, value } = value {
-                            let (i, v) = e
-                                .variants
-                                .iter()
-                                .enumerate()
-                                .find(|(_, v)| v.name == *variant)
-                                .ok_or_else(|| error("unknown enum variant"))?;
+                            let mut selected = None;
+                            for (index, candidate) in e.variants.iter().enumerate() {
+                                schema.charge_text(
+                                    candidate.name.len().saturating_add(variant.len()),
+                                )?;
+                                if candidate.name == *variant {
+                                    selected = Some((index, candidate));
+                                    break;
+                                }
+                            }
+                            let (i, v) = selected.ok_or_else(|| error("unknown enum variant"))?;
                             out.push(Felt::from(i));
-                            return self.encode(&v.r#type, value, out, depth + 1);
+                            return self.encode(&v.r#type, value, out, depth + 1, schema);
                         }
                         return Err(error("expected enum"));
                     }
@@ -486,16 +587,19 @@ impl ContractAbi {
         data: &mut &[Felt],
         depth: usize,
         budget: &mut usize,
+        schema: &mut SchemaBudget,
     ) -> Result<AbiValue, AbiError> {
         *budget = budget
             .checked_sub(1)
             .ok_or_else(|| error("decoded values exceed one million nodes"))?;
+        schema.charge_text(ty.len().saturating_mul(4))?;
+        schema.charge_owned(ty.len().saturating_add(2 * std::mem::size_of::<AbiValue>()))?;
         if depth > 64 {
             return Err(error("ABI nesting exceeds 64"));
         }
         let ty = ty.trim();
         if let Some(inner) = ty.strip_prefix('@') {
-            return self.decode(inner, data, depth + 1, budget);
+            return self.decode(inner, data, depth + 1, budget, schema);
         }
         if scalar_bits(ty).is_some() {
             let f = take(data)?;
@@ -505,9 +609,10 @@ impl ContractAbi {
         if ty == "core::integer::u256" {
             let mut fields = BTreeMap::new();
             for name in ["low", "high"] {
+                schema.charge_owned(name.len() + std::mem::size_of::<String>())?;
                 fields.insert(
                     name.to_owned(),
-                    self.decode("core::integer::u128", data, depth + 1, budget)?,
+                    self.decode("core::integer::u128", data, depth + 1, budget, schema)?,
                 );
             }
             return Ok(AbiValue::Struct(fields));
@@ -540,6 +645,7 @@ impl ContractAbi {
                 .checked_mul(31)
                 .and_then(|size| size.checked_add(pending_len))
                 .ok_or_else(|| error("ByteArray size overflow"))?;
+            schema.charge_owned(capacity)?;
             let mut bytes = Vec::with_capacity(capacity);
             for _ in 0..n {
                 let word = take(data)?.to_bytes_be();
@@ -563,14 +669,13 @@ impl ContractAbi {
             }
             let mut values = Vec::new();
             for _ in 0..n {
-                values.push(self.decode(inner, data, depth + 1, budget)?);
+                values.push(self.decode(inner, data, depth + 1, budget, schema)?);
             }
             return Ok(AbiValue::Sequence(values));
         }
         if let Some(types) = tuple_types(ty)? {
             return types
-                .iter()
-                .map(|t| self.decode(t, data, depth + 1, budget))
+                .map(|t| self.decode(t, data, depth + 1, budget, schema))
                 .collect::<Result<Vec<_>, _>>()
                 .map(AbiValue::Sequence);
         }
@@ -579,9 +684,13 @@ impl ContractAbi {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut values = BTreeMap::new();
                     for m in &s.members {
+                        schema.charge_text(m.name.len())?;
+                        schema.charge_owned(
+                            m.name.len().saturating_add(std::mem::size_of::<String>()),
+                        )?;
                         values.insert(
                             m.name.clone(),
-                            self.decode(&m.r#type, data, depth + 1, budget)?,
+                            self.decode(&m.r#type, data, depth + 1, budget, schema)?,
                         );
                     }
                     return Ok(AbiValue::Struct(values));
@@ -592,9 +701,10 @@ impl ContractAbi {
                         .variants
                         .get(index)
                         .ok_or_else(|| error("invalid enum discriminant"))?;
+                    schema.charge_owned(v.name.len())?;
                     return Ok(AbiValue::Enum {
                         variant: v.name.clone(),
-                        value: Box::new(self.decode(&v.r#type, data, depth + 1, budget)?),
+                        value: Box::new(self.decode(&v.r#type, data, depth + 1, budget, schema)?),
                     });
                 }
                 _ => {}
@@ -632,32 +742,54 @@ fn array_inner(ty: &str) -> Option<&str> {
         .iter()
         .find_map(|p| ty.strip_prefix(p).and_then(|t| t.strip_suffix('>')))
 }
-fn tuple_types(ty: &str) -> Result<Option<Vec<&str>>, AbiError> {
+#[derive(Clone)]
+struct TupleTypes<'a> {
+    inner: &'a str,
+}
+impl<'a> Iterator for TupleTypes<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.inner.is_empty() {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (index, character) in self.inner.char_indices() {
+            match character {
+                '(' | '<' | '[' => depth += 1,
+                ')' | '>' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    let field = self.inner[..index].trim();
+                    self.inner = &self.inner[index + 1..];
+                    return Some(field);
+                }
+                _ => {}
+            }
+        }
+        let field = self.inner.trim();
+        self.inner = "";
+        Some(field)
+    }
+}
+fn tuple_types(ty: &str) -> Result<Option<TupleTypes<'_>>, AbiError> {
     if !ty.starts_with('(') {
         return Ok(None);
     }
     let inner = ty
         .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|text| text.strip_suffix(')'))
         .ok_or_else(|| error("malformed tuple type"))?;
-    if inner.trim().is_empty() {
-        return Ok(Some(vec![]));
-    }
-    let mut depth = 0i32;
-    let mut start = 0;
-    let mut fields = vec![];
-    for (i, c) in inner.char_indices() {
-        match c {
-            '(' | '<' | '[' => depth += 1,
-            ')' | '>' | ']' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(error("malformed tuple type"));
-                }
+    let mut depth = 0usize;
+    for character in inner.chars() {
+        match character {
+            '(' | '<' | '[' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| error("malformed tuple type"))?;
             }
-            ',' if depth == 0 => {
-                fields.push(inner[start..i].trim());
-                start = i + 1;
+            ')' | '>' | ']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| error("malformed tuple type"))?;
             }
             _ => {}
         }
@@ -665,11 +797,9 @@ fn tuple_types(ty: &str) -> Result<Option<Vec<&str>>, AbiError> {
     if depth != 0 {
         return Err(error("malformed tuple type"));
     }
-    let tail = inner[start..].trim();
-    if !tail.is_empty() {
-        fields.push(tail);
-    }
-    Ok(Some(fields))
+    Ok(Some(TupleTypes {
+        inner: inner.trim(),
+    }))
 }
 fn take(data: &mut &[Felt]) -> Result<Felt, AbiError> {
     let (first, rest) = data
@@ -800,6 +930,216 @@ impl std::error::Error for ContractCallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_enum_encoding_charges_variant_name_search_work() {
+        let names: Vec<_> = (0..4)
+            .map(|index| format!("v{index}{}", "x".repeat(64)))
+            .collect();
+        let variants: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({"name":name,"type":"()"}))
+            .collect();
+        let abi = ContractAbi::from_json(
+            &serde_json::json!([{"type":"enum","name":"E","variants":variants}]).to_string(),
+        )
+        .unwrap();
+        let value = AbiValue::Sequence(vec![
+            AbiValue::Enum {
+                variant: names[3].clone(),
+                value: Box::new(AbiValue::Sequence(vec![]))
+            };
+            3
+        ]);
+        let root = "core::array::Array::<E>";
+        assert_eq!(
+            abi.encode_value(root, &value).unwrap(),
+            vec![Felt::from(3u64); 4]
+        );
+        let mut resources = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        resources.text = 500;
+        assert_eq!(
+            abi.encode(root, &value, &mut vec![], 0, &mut resources)
+                .unwrap_err()
+                .to_string(),
+            "ABI type text exceeds work budget"
+        );
+        assert!(resources.exceeded);
+    }
+
+    #[test]
+    fn byte_output_limit_is_checked_before_byte_array_encoding_allocation() {
+        let abi = ContractAbi::from_json("[]").unwrap();
+        let mut budget = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        budget.owned = 100;
+        let mut output = vec![];
+        assert_eq!(
+            abi.encode(
+                "core::byte_array::ByteArray",
+                &AbiValue::Bytes(vec![7; 512]),
+                &mut output,
+                0,
+                &mut budget
+            )
+            .unwrap_err()
+            .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert_eq!(output, [] as [Felt; 0]);
+        assert!(budget.exceeded);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn cloned_abis_share_cache_capacity_and_count_concurrent_root_once() {
+        let abi = ContractAbi::from_json(r#"[{"type":"struct","name":"S","members":[]}]"#).unwrap();
+        let initial = abi.schema_results.read().unwrap().remaining;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cloned = abi.clone();
+                scope.spawn(move || {
+                    cloned
+                        .validate_type("S", &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+                        .unwrap();
+                });
+            }
+        });
+        let cache = abi.schema_results.read().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(initial - cache.remaining, "S".len() + 128);
+    }
+
+    #[test]
+    fn text_exhaustion_and_cached_diagnostic_copy_cannot_poison_structural_results() {
+        let unknown = "Unknown".repeat(64);
+        let json = serde_json::json!([{"type":"struct","name":"S","members":[{"name":"field","type":unknown}]}]).to_string();
+        let codec = ContractAbi::from_json(&json).unwrap();
+        let mut budget = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        budget.text = 16;
+        assert_eq!(
+            codec
+                .validate_type("S", &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI type text exceeds work budget"
+        );
+        assert!(budget.exceeded);
+        assert_eq!(codec.schema_results.read().unwrap().len(), 0);
+        let expected = format!("unsupported type: {unknown}");
+        assert_eq!(
+            codec
+                .validate_type("S", &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        let mut budget = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        budget.owned = 16;
+        assert_eq!(
+            codec
+                .validate_type("S", &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert!(budget.exceeded);
+        assert_eq!(
+            codec
+                .validate_type("S", &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn logical_byte_limit_bounds_repeated_owned_member_and_variant_names() {
+        let long = "x".repeat(256);
+        for declaration in [
+            serde_json::json!({"type":"struct","name":"S","members":[{"name":long,"type":"()"}]}),
+            serde_json::json!({"type":"enum","name":"S","variants":[{"name":long,"type":"()"}]}),
+        ] {
+            let is_enum = declaration["type"] == "enum";
+            let json = serde_json::json!([declaration]).to_string();
+            let codec = ContractAbi::from_json(&json).unwrap();
+            let root = "core::array::Array::<S>".to_owned();
+            let data = if is_enum {
+                vec![
+                    Felt::from(4u64),
+                    Felt::ZERO,
+                    Felt::ZERO,
+                    Felt::ZERO,
+                    Felt::ZERO,
+                ]
+            } else {
+                vec![Felt::from(4u64)]
+            };
+            assert!(
+                matches!(codec.decode_value(&root, &mut data.as_slice()).unwrap(), AbiValue::Sequence(values) if values.len() == 4)
+            );
+            let mut resources = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+            resources.owned = 512;
+            assert_eq!(
+                codec
+                    .decode(&root, &mut data.as_slice(), 0, &mut 100, &mut resources)
+                    .unwrap_err()
+                    .to_string(),
+                "ABI logical allocation exceeds byte budget"
+            );
+            assert!(resources.exceeded);
+            assert!(
+                matches!(codec.decode_value(&root, &mut data.as_slice()).unwrap(), AbiValue::Sequence(values) if values.len() == 4)
+            );
+        }
+    }
+    #[test]
+    fn repeated_borrowed_tuple_parsing_obeys_text_work_limit() {
+        let json = "[]".to_owned();
+        let codec = ContractAbi::from_json(&json).unwrap();
+        let root = format!("core::array::Array::<((),{}())>", " ".repeat(512));
+        let data = [Felt::from(3u64)];
+        assert!(
+            matches!(codec.decode_value(&root, &mut data.as_slice()).unwrap(), AbiValue::Sequence(values) if values.len() == 3)
+        );
+        let mut resources = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        resources.text = 5_000;
+        assert_eq!(
+            codec
+                .decode(&root, &mut data.as_slice(), 0, &mut 100, &mut resources)
+                .unwrap_err()
+                .to_string(),
+            "ABI type text exceeds work budget"
+        );
+        assert!(resources.exceeded);
+        assert!(
+            matches!(codec.decode_value(&root, &mut data.as_slice()).unwrap(), AbiValue::Sequence(values) if values.len() == 3)
+        );
+        for malformed in ["(()", "())", "((),<)", "((),>)"] {
+            assert!(tuple_types(malformed).is_err());
+        }
+        assert_eq!(tuple_types(" ( )".trim()).unwrap().unwrap().count(), 0);
+        assert_eq!(
+            tuple_types("((), (), )")
+                .unwrap()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["()", "()"]
+        );
+    }
+    #[test]
+    fn full_optional_schema_cache_does_not_reject_valid_values() {
+        let json = r#"[{"type":"struct","name":"S","members":[]}]"#.to_owned();
+        let codec = ContractAbi::from_json(&json).unwrap();
+        codec.schema_results.write().unwrap().remaining = 0;
+        let root = "S".to_owned();
+        let data: [Felt; 0] = [];
+        for _ in 0..2 {
+            assert_eq!(
+                codec.decode_value(&root, &mut data.as_slice()).unwrap(),
+                AbiValue::Struct(BTreeMap::new())
+            );
+        }
+        assert_eq!(codec.schema_results.read().unwrap().len(), 0);
+    }
+
     #[test]
     fn distinct_roots_share_schema_work_and_exhaustion_does_not_poison_cache() {
         let members: Vec<_> = (0..32)
@@ -1341,7 +1681,8 @@ mod tests {
                 "core::array::Array::<core::array::Array::<()>>",
                 &mut data.as_slice(),
                 0,
-                &mut 10
+                &mut 10,
+                &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK),
             )
             .is_err()
         );
@@ -1614,7 +1955,13 @@ mod tests {
         let mut budget = 3usize;
         assert_eq!(
             codec
-                .decode("core::byte_array::ByteArray", &mut input, 0, &mut budget)
+                .decode(
+                    "core::byte_array::ByteArray",
+                    &mut input,
+                    0,
+                    &mut budget,
+                    &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK)
+                )
                 .unwrap(),
             AbiValue::Bytes(vec![0; 31])
         );
@@ -1623,7 +1970,13 @@ mod tests {
         let mut budget = 2usize;
         assert!(
             codec
-                .decode("core::byte_array::ByteArray", &mut input, 0, &mut budget)
+                .decode(
+                    "core::byte_array::ByteArray",
+                    &mut input,
+                    0,
+                    &mut budget,
+                    &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK)
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("node")
@@ -1634,7 +1987,13 @@ mod tests {
         let mut budget = 3usize;
         assert_eq!(
             codec
-                .decode("core::byte_array::ByteArray", &mut input, 0, &mut budget)
+                .decode(
+                    "core::byte_array::ByteArray",
+                    &mut input,
+                    0,
+                    &mut budget,
+                    &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK)
+                )
                 .unwrap_err()
                 .to_string(),
             "truncated ByteArray"

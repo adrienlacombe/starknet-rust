@@ -31,3 +31,15 @@ Each public encode/decode operation also has a separate one-million-unit schema-
 shared across all argument or output roots, including both phases of a contract view call. Graph visits and declaration edges consume this
 budget even for empty arrays; completed root validations are cached. Exceptionally complex cold
 schemas may hit this resource cap. Exhaustion is never cached as an invalid schema; a later call starts with a fresh budget.
+
+Operations additionally enforce independent 64 MiB allowances for logical owned storage and
+type-text work. Logical accounting includes value/container slots, copied identifiers and
+diagnostics, ByteArray/encoded buffers, and schema temporaries; it is not an exact allocator
+or process-memory measurement. Type text is charged before repeated parsing or name searches.
+Tuple fields are traversed with a borrowed iterator, without eager per-value field vectors.
+The immutable loaded ABI/indexes and caller-owned input values/felts form the storage baseline
+outside these allowances.
+Completed schema-cache entries have a separate shared 64 MiB logical capacity; a full cache
+skips optional insertions while valid decoding continues. Resource failures are not cached.
+Contract view calls share allowances across encoding and decoding. Very large valid cold schemas
+or outputs may reach these private resource caps.
