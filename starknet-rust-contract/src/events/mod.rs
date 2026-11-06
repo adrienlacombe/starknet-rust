@@ -48,21 +48,70 @@ impl std::fmt::Debug for EventDecoder {
 }
 impl EventDecoder {
     /// Creates a decoder and rejects unknown event types, cycles, and ambiguous selector paths.
+    /// Event container identifiers must be unique, and interface nesting is limited to 64.
     pub fn new(entries: Vec<AbiEntry>, root: &str) -> Result<Self, EventDecodeError> {
-        fn flatten(entries: Vec<AbiEntry>, out: &mut Vec<AbiEntry>) {
-            for e in entries {
-                match e {
-                    AbiEntry::Interface(i) => flatten(i.items, out),
-                    e => out.push(e),
+        fn flatten(entries: Vec<AbiEntry>, out: &mut Vec<AbiEntry>) -> bool {
+            let mut pending: Vec<_> = entries
+                .into_iter()
+                .rev()
+                .map(|entry| (entry, 0usize))
+                .collect();
+            let mut exceeded = false;
+            while let Some((entry, depth)) = pending.pop() {
+                match entry {
+                    AbiEntry::Interface(interface) => {
+                        exceeded |= depth >= 64;
+                        pending.extend(
+                            interface
+                                .items
+                                .into_iter()
+                                .rev()
+                                .map(|entry| (entry, depth.saturating_add(1))),
+                        );
+                    }
+                    entry => {
+                        if !exceeded {
+                            out.push(entry);
+                        }
+                    }
                 }
+                // Even after a violation, drain every owned interface subtree iteratively.
+                // Returning early would recursively drop an unprocessed deep subtree.
             }
+            exceeded
+        }
+        fn unique_names<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+            let mut seen = BTreeSet::new();
+            names.all(|name| seen.insert(name))
         }
         let mut flat = vec![];
-        flatten(entries, &mut flat);
+        if flatten(entries, &mut flat) {
+            return Err(error("ABI interface nesting exceeds 64"));
+        }
         let types = EventTypes::new(flat);
         let mut event_names = BTreeSet::new();
         let mut type_names = BTreeSet::new();
         for entry in &types.entries {
+            match entry {
+                AbiEntry::Event(AbiEvent::Typed(TypedAbiEvent::Enum(event)))
+                    if !unique_names(
+                        event.variants.iter().map(|variant| variant.name.as_str()),
+                    ) =>
+                {
+                    return Err(error("duplicate event enum variant"));
+                }
+                AbiEntry::Event(AbiEvent::Typed(TypedAbiEvent::Struct(event)))
+                    if !unique_names(event.members.iter().map(|member| member.name.as_str())) =>
+                {
+                    return Err(error("duplicate event member"));
+                }
+                AbiEntry::Event(AbiEvent::Untyped(event))
+                    if !unique_names(event.inputs.iter().map(|member| member.name.as_str())) =>
+                {
+                    return Err(error("duplicate event member"));
+                }
+                _ => {}
+            }
             let (names, name) = match entry {
                 AbiEntry::Event(e) => (&mut event_names, event_name(e)),
                 AbiEntry::Struct(s) => (&mut type_names, s.name.as_str()),
@@ -281,6 +330,101 @@ fn event_name(e: &AbiEvent) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn nested_interfaces(mut entry: AbiEntry, depth: usize) -> AbiEntry {
+        for _ in 0..depth {
+            entry = AbiEntry::Interface(starknet_rust_core::types::contract::AbiInterface {
+                name: "Interface".into(),
+                items: vec![entry],
+            });
+        }
+        entry
+    }
+    fn empty_event(name: &str) -> AbiEntry {
+        serde_json::from_value(
+            serde_json::json!({"type":"event","name":name,"kind":"struct","members":[]}),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn interface_flattening_preserves_order_and_enforces_its_depth_boundary() {
+        let decoder = EventDecoder::new(
+            vec![
+                empty_event("Before"),
+                nested_interfaces(empty_event("Leaf"), 64),
+                empty_event("After"),
+            ],
+            "Leaf",
+        )
+        .unwrap();
+        let names: Vec<_> = decoder
+            .types
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                AbiEntry::Event(event) => event_name(event),
+                _ => panic!("unexpected flattened entry"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Before", "Leaf", "After"]);
+        assert_eq!(
+            EventDecoder::new(vec![nested_interfaces(empty_event("Leaf"), 65)], "Leaf")
+                .unwrap_err()
+                .to_string(),
+            "ABI interface nesting exceeds 64"
+        );
+        let empty = AbiEntry::Interface(starknet_rust_core::types::contract::AbiInterface {
+            name: "Empty".into(),
+            items: vec![],
+        });
+        assert_eq!(
+            EventDecoder::new(
+                vec![empty_event("Leaf"), nested_interfaces(empty, 64)],
+                "Leaf"
+            )
+            .unwrap_err()
+            .to_string(),
+            "ABI interface nesting exceeds 64"
+        );
+    }
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn deeply_nested_owned_interfaces_are_drained_without_recursive_drops() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let entries = (0..2)
+                    .map(|_| nested_interfaces(empty_event("Leaf"), 20_000))
+                    .collect();
+                assert_eq!(
+                    EventDecoder::new(entries, "Leaf").unwrap_err().to_string(),
+                    "ABI interface nesting exceeds 64"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+    #[test]
+    fn duplicate_event_identifiers_are_rejected_independently_of_selector_paths() {
+        let duplicate_variants = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"Same","type":"Left","kind":"flat"},{"name":"Same","type":"Right","kind":"flat"}]},{"type":"event","name":"Left","kind":"enum","variants":[{"name":"LeftLeaf","type":"Leaf","kind":"nested"}]},{"type":"event","name":"Right","kind":"enum","variants":[{"name":"RightLeaf","type":"Leaf","kind":"nested"}]},{"type":"event","name":"Leaf","kind":"struct","members":[]}]"#;
+        assert_eq!(
+            EventDecoder::from_json(duplicate_variants, "Root")
+                .unwrap_err()
+                .to_string(),
+            "duplicate event enum variant"
+        );
+        for abi in [
+            r#"[{"type":"event","name":"Root","kind":"struct","members":[{"name":"same","type":"core::felt252","kind":"key"},{"name":"same","type":"core::felt252","kind":"data"}]}]"#,
+            r#"[{"type":"event","name":"Root","inputs":[{"name":"same","type":"core::felt252"},{"name":"same","type":"core::felt252"}]}]"#,
+        ] {
+            assert_eq!(
+                EventDecoder::from_json(abi, "Root")
+                    .unwrap_err()
+                    .to_string(),
+                "duplicate event member"
+            );
+        }
+    }
     const ABI: &str = r#"[{"type":"event","name":"app::Event","kind":"enum","variants":[{"name":"Token","type":"erc20::Event","kind":"flat"},{"name":"Paused","type":"app::Paused","kind":"nested"}]},{"type":"event","name":"erc20::Event","kind":"enum","variants":[{"name":"Transfer","type":"erc20::Transfer","kind":"nested"}]},{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"event","name":"erc20::Transfer","kind":"struct","members":[{"name":"from","type":"core::starknet::contract_address::ContractAddress","kind":"key"},{"name":"to","type":"core::starknet::contract_address::ContractAddress","kind":"key"},{"name":"amount","type":"core::integer::u256","kind":"data"}]},{"type":"event","name":"app::Paused","kind":"struct","members":[{"name":"paused","type":"core::bool","kind":"data"}]}]"#;
     #[test]
     fn matching_routes_preserve_specific_decode_failures() {
