@@ -126,8 +126,10 @@ impl EventDecoder {
             types,
             routes: vec![],
         };
-        let is_untyped = matches!(decoder.event(root)?, AbiEvent::Untyped(_));
-        decoder.routes(
+        let is_untyped = matches!(Self::event(&decoder.types, root)?, AbiEvent::Untyped(_));
+        Self::collect_routes(
+            &decoder.types,
+            &mut decoder.routes,
             root,
             if is_untyped {
                 vec![selector(short_name(root))?]
@@ -155,18 +157,19 @@ impl EventDecoder {
             root,
         )
     }
-    fn event(&self, name: &str) -> Result<&AbiEvent, EventDecodeError> {
-        self.types
+    fn event<'a>(types: &'a EventTypes, name: &str) -> Result<&'a AbiEvent, EventDecodeError> {
+        types
             .event_indices
             .get(name)
-            .and_then(|index| match &self.types.entries[*index] {
+            .and_then(|index| match &types.entries[*index] {
                 AbiEntry::Event(event) => Some(event),
                 _ => None,
             })
             .ok_or_else(|| error(format!("unknown event type: {name}")))
     }
-    fn routes(
-        &mut self,
+    fn collect_routes(
+        types: &EventTypes,
+        routes: &mut Vec<Route>,
         ty: &str,
         selectors: Vec<Felt>,
         path: Vec<String>,
@@ -176,16 +179,18 @@ impl EventDecoder {
         *budget = budget
             .checked_sub(1)
             .ok_or_else(|| error("event ABI traversal exceeds 4096 nodes"))?;
-        if self.routes.len() >= 4096 {
+        if routes.len() >= 4096 {
             return Err(error("event ABI exceeds 4096 routes"));
         }
         if stack.len() > 64 || stack.iter().any(|s| s == ty) {
             return Err(error("cyclic or excessively nested event ABI"));
         }
         stack.push(ty.into());
-        match self.event(ty)?.clone() {
+        // ABI definitions stay in one immutable store. Only route metadata is
+        // copied; a large leaf shared by many aliases is never cloned per visit.
+        match Self::event(types, ty)? {
             AbiEvent::Typed(TypedAbiEvent::Enum(e)) => {
-                for v in e.variants {
+                for v in &e.variants {
                     let mut selectors = selectors.clone();
                     match v.kind {
                         EventFieldKind::Nested => selectors.push(selector(&v.name)?),
@@ -193,11 +198,11 @@ impl EventDecoder {
                         _ => return Err(error("event enum variants must be nested or flat")),
                     }
                     let mut path = path.clone();
-                    path.push(v.name);
-                    self.routes(&v.r#type, selectors, path, stack, budget)?;
+                    path.push(v.name.clone());
+                    Self::collect_routes(types, routes, &v.r#type, selectors, path, stack, budget)?;
                 }
             }
-            _ => self.routes.push(Route {
+            _ => routes.push(Route {
                 selectors,
                 path,
                 ty: ty.into(),
@@ -272,7 +277,7 @@ impl EventDecoder {
             return Err(error("event nesting exceeds 64"));
         }
         let mut fields = BTreeMap::new();
-        match self.event(ty)? {
+        match Self::event(&self.types, ty)? {
             AbiEvent::Untyped(e) => {
                 for m in &e.inputs {
                     if fields
@@ -422,6 +427,76 @@ mod tests {
                     .unwrap_err()
                     .to_string(),
                 "duplicate event member"
+            );
+        }
+    }
+    #[test]
+    fn declared_syntactic_types_cannot_be_hidden_in_event_fields() {
+        let cases = [
+            ("core::array::Array::<core::felt252>", vec![Felt::ZERO]),
+            ("core::array::Span::<core::felt252>", vec![Felt::ZERO]),
+            ("(core::felt252, core::bool)", vec![Felt::ZERO, Felt::ZERO]),
+            ("()", vec![]),
+        ];
+        let expected: Vec<_> = cases
+            .iter()
+            .map(|(ty, _)| (*ty, Some("duplicate ABI struct member".to_owned())))
+            .collect();
+        let mut actual = vec![];
+        for (ty, data) in cases {
+            let abi = serde_json::json!([
+                {"type":"struct","name":ty,"members":[{"name":"same","type":"()"},{"name":"same","type":"()"}]},
+                {"type":"event","name":"Root","kind":"struct","members":[{"name":"value","type":ty,"kind":"data"}]}
+            ]);
+            let decoder = EventDecoder::from_json(&abi.to_string(), "Root").unwrap();
+            actual.push((
+                ty,
+                decoder
+                    .decode(&Event {
+                        from_address: Felt::ONE,
+                        keys: vec![],
+                        data,
+                    })
+                    .err()
+                    .map(|error| error.to_string()),
+            ));
+        }
+        assert_eq!(actual, expected);
+    }
+    #[test]
+    fn many_alias_routes_share_and_decode_one_large_leaf_definition() {
+        let members: Vec<_> = (0..4096).map(|index| serde_json::json!({"name":format!("field{index}"),"type":"core::felt252","kind":"data"})).collect();
+        let variants: Vec<_> = (0..128).map(|index| serde_json::json!({"name":format!("Route{index}"),"type":"LargeLeaf","kind":"nested"})).collect();
+        let abi = serde_json::json!([
+            {"type":"event","name":"Root","kind":"enum","variants":variants},
+            {"type":"event","name":"LargeLeaf","kind":"struct","members":members}
+        ]);
+        let decoder = EventDecoder::from_json(&abi.to_string(), "Root").unwrap();
+        assert_eq!(decoder.routes.len(), 128);
+        assert_eq!(decoder.types.entries.len(), 2);
+        let leaf = EventDecoder::event(&decoder.types, "LargeLeaf").unwrap();
+        for route in &decoder.routes {
+            assert!(std::ptr::eq(
+                leaf,
+                EventDecoder::event(&decoder.types, &route.ty).unwrap()
+            ));
+        }
+        for index in [0, 64, 127] {
+            let name = format!("Route{index}");
+            let result = decoder
+                .decode(&Event {
+                    from_address: Felt::THREE,
+                    keys: vec![selector(&name).unwrap()],
+                    data: (0..4096_u64).map(Felt::from).collect(),
+                })
+                .unwrap();
+            assert_eq!(result.event_type, "LargeLeaf");
+            assert_eq!(result.path, vec![name]);
+            assert_eq!(result.fields.len(), 4096);
+            assert_eq!(result.fields["field0"], EventValue::Felt(Felt::ZERO));
+            assert_eq!(
+                result.fields["field4095"],
+                EventValue::Felt(Felt::from(4095_u64))
             );
         }
     }

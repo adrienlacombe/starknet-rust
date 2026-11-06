@@ -138,15 +138,38 @@ impl EventTypes {
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
-        // Builtin wire encodings do not exempt an explicit ABI declaration from
-        // duplicate-name and nested-type validation.
-        if !self.type_indices.contains_key(ty)
-            && (scalar_bits(ty).is_some()
-                || matches!(
-                    ty,
-                    "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
-                ))
-        {
+        // Every explicit declaration is checked before any wire-syntax shortcut.
+        // The wire form is still checked afterwards: a declared Array/tuple cannot
+        // hide unsupported implicit element types by supplying an empty struct.
+        let declared = match self.type_indices.get(ty).map(|index| &self.entries[*index]) {
+            Some(AbiEntry::Struct(definition)) => {
+                let mut names = std::collections::BTreeSet::new();
+                for member in &definition.members {
+                    if !names.insert(&member.name) {
+                        return Err(error("duplicate ABI struct member"));
+                    }
+                    self.validate_type_graph(&member.r#type, seen, depth + 1)?;
+                }
+                true
+            }
+            Some(AbiEntry::Enum(definition)) => {
+                let mut names = std::collections::BTreeSet::new();
+                for variant in &definition.variants {
+                    if !names.insert(&variant.name) {
+                        return Err(error("duplicate ABI enum variant"));
+                    }
+                    self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
+                }
+                true
+            }
+            _ => false,
+        };
+        if ty == "core::integer::u256" {
+            // The builtin codec recursively uses this named limb type even when
+            // the ABI omits a u256 declaration.
+            return self.validate_type_graph("core::integer::u128", seen, depth + 1);
+        }
+        if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
             return Ok(());
         }
         if let Some(inner) = array_inner(ty) {
@@ -158,32 +181,11 @@ impl EventTypes {
             }
             return Ok(());
         }
-        if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
-            match entry {
-                AbiEntry::Struct(s) if s.name == ty => {
-                    let mut names = std::collections::BTreeSet::new();
-                    for member in &s.members {
-                        if !names.insert(&member.name) {
-                            return Err(error("duplicate ABI struct member"));
-                        }
-                        self.validate_type_graph(&member.r#type, seen, depth + 1)?;
-                    }
-                    return Ok(());
-                }
-                AbiEntry::Enum(e) if e.name == ty => {
-                    let mut names = std::collections::BTreeSet::new();
-                    for variant in &e.variants {
-                        if !names.insert(&variant.name) {
-                            return Err(error("duplicate ABI enum variant"));
-                        }
-                        self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
+        if declared {
+            Ok(())
+        } else {
+            Err(error(format!("unsupported type: {ty}")))
         }
-        Err(error(format!("unsupported type: {ty}")))
     }
     fn decode(
         &self,
@@ -588,6 +590,133 @@ mod tests {
                     &mut NodeBudget::new(10)
                 )
                 .is_err()
+        );
+    }
+    #[test]
+    fn all_special_wire_forms_validate_explicit_declarations_first() {
+        for ty in [
+            "core::felt252",
+            "core::starknet::contract_address::ContractAddress",
+            "core::starknet::class_hash::ClassHash",
+            "core::starknet::storage_access::StorageAddress",
+            "core::integer::u8",
+            "core::integer::u16",
+            "core::integer::u32",
+            "core::integer::u64",
+            "core::integer::u96",
+            "core::integer::u128",
+            "core::bytes_31::bytes31",
+            "core::bool",
+            "core::integer::u256",
+            "core::byte_array::ByteArray",
+            "core::array::Array::<core::felt252>",
+            "core::array::Span::<core::felt252>",
+            "(core::felt252, core::bool)",
+            "()",
+        ] {
+            for (declaration, expected) in [
+                (
+                    serde_json::json!({"type":"struct","name":ty,"members":[{"name":"bad","type":"Unknown"}]}),
+                    "unsupported type: Unknown",
+                ),
+                (
+                    serde_json::json!({"type":"struct","name":ty,"members":[{"name":"same","type":"()"},{"name":"same","type":"()"}]}),
+                    "duplicate ABI struct member",
+                ),
+                (
+                    serde_json::json!({"type":"enum","name":ty,"variants":[{"name":"Same","type":"()"},{"name":"Same","type":"()"}]}),
+                    "duplicate ABI enum variant",
+                ),
+            ] {
+                let decoder = EventTypes::new(
+                    serde_json::from_value(serde_json::json!([declaration])).unwrap(),
+                );
+                for root in [ty.to_owned(), format!("core::array::Array::<{ty}>")] {
+                    for _ in 0..2 {
+                        let input = [Felt::ZERO; 3];
+                        let mut data = input.as_slice();
+                        assert_eq!(
+                            decoder
+                                .decode_value(&root, &mut data, &mut NodeBudget::new(100))
+                                .unwrap_err()
+                                .to_string(),
+                            expected,
+                            "{root}"
+                        );
+                        assert_eq!(data, input.as_slice());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn valid_declared_syntactic_forms_keep_their_wire_encodings() {
+        for (ty, value, wire) in [
+            (
+                "core::array::Array::<core::felt252>",
+                EventValue::Sequence(vec![EventValue::Felt(Felt::THREE)]),
+                vec![Felt::ONE, Felt::THREE],
+            ),
+            (
+                "core::array::Span::<core::felt252>",
+                EventValue::Sequence(vec![EventValue::Felt(Felt::THREE)]),
+                vec![Felt::ONE, Felt::THREE],
+            ),
+            (
+                "(core::felt252, core::bool)",
+                EventValue::Sequence(vec![EventValue::Felt(Felt::THREE), EventValue::Bool(true)]),
+                vec![Felt::THREE, Felt::ONE],
+            ),
+            ("()", EventValue::Sequence(vec![]), vec![]),
+        ] {
+            let declaration = serde_json::json!({"type":"struct","name":ty,"members":[]});
+            let decoder =
+                EventTypes::new(serde_json::from_value(serde_json::json!([declaration])).unwrap());
+
+            let mut data = wire.as_slice();
+            assert_eq!(
+                decoder
+                    .decode_value(ty, &mut data, &mut NodeBudget::new(100))
+                    .unwrap(),
+                value
+            );
+            assert_eq!(data, [] as [Felt; 0]);
+        }
+    }
+    #[test]
+    fn explicit_syntactic_declarations_also_validate_implicit_wire_elements() {
+        for ty in [
+            "core::array::Array::<Unknown>",
+            "core::array::Span::<Unknown>",
+            "(core::felt252, Unknown)",
+        ] {
+            let declaration = serde_json::json!({"type":"struct","name":ty,"members":[]});
+            let decoder =
+                EventTypes::new(serde_json::from_value(serde_json::json!([declaration])).unwrap());
+            for root in [ty.to_owned(), format!("core::array::Array::<{ty}>")] {
+                let input = [Felt::ZERO; 3];
+                let mut data = input.as_slice();
+                assert_eq!(
+                    decoder
+                        .decode_value(&root, &mut data, &mut NodeBudget::new(100))
+                        .unwrap_err()
+                        .to_string(),
+                    "unsupported type: Unknown"
+                );
+                assert_eq!(data, input.as_slice());
+            }
+        }
+        let declaration = serde_json::json!({"type":"struct","name":"core::integer::u128","members":[{"name":"bad","type":"Unknown"}]});
+        let decoder =
+            EventTypes::new(serde_json::from_value(serde_json::json!([declaration])).unwrap());
+
+        let mut input = [Felt::ZERO; 2].as_slice();
+        assert_eq!(
+            decoder
+                .decode_value("core::integer::u256", &mut input, &mut NodeBudget::new(100))
+                .unwrap_err()
+                .to_string(),
+            "unsupported type: Unknown"
         );
     }
 }
