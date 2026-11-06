@@ -235,11 +235,14 @@ impl ContractAbi {
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
-        if scalar_bits(ty).is_some()
-            || matches!(
-                ty,
-                "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
-            )
+        // Builtin wire encodings do not exempt an explicit ABI declaration from
+        // duplicate-name and nested-type validation.
+        if !self.type_indices.contains_key(ty)
+            && (scalar_bits(ty).is_some()
+                || matches!(
+                    ty,
+                    "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
+                ))
         {
             return Ok(());
         }
@@ -675,7 +678,8 @@ mod tests {
     use super::*;
     #[derive(Debug)]
     struct MockTransport;
-    #[async_trait::async_trait]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     impl starknet_rust_providers::jsonrpc::JsonRpcTransport for MockTransport {
         type Error = serde_json::Error;
         async fn send_request<
@@ -826,6 +830,92 @@ mod tests {
             abi.encode_value("core::integer::u256", &AbiValue::Struct(BTreeMap::new()))
                 .is_err()
         );
+    }
+    #[test]
+    fn declared_builtin_schemas_are_validated_before_encoding_or_decoding() {
+        for (ty, kind, fields, expected) in [
+            (
+                "core::integer::u256",
+                "struct",
+                serde_json::json!([{"name":"low","type":"core::integer::u128"},{"name":"low","type":"core::integer::u128"}]),
+                "duplicate ABI struct member",
+            ),
+            (
+                "core::bool",
+                "enum",
+                serde_json::json!([{"name":"False","type":"()"},{"name":"False","type":"()"}]),
+                "duplicate ABI enum variant",
+            ),
+            (
+                "core::felt252",
+                "struct",
+                serde_json::json!([{"name":"value","type":"Unknown"}]),
+                "unsupported type: Unknown",
+            ),
+            (
+                "core::byte_array::ByteArray",
+                "struct",
+                serde_json::json!([{"name":"data","type":"Unknown"}]),
+                "unsupported type: Unknown",
+            ),
+        ] {
+            let mut declaration = serde_json::json!({"type":kind,"name":ty});
+            declaration[if kind == "enum" {
+                "variants"
+            } else {
+                "members"
+            }] = fields;
+            let abi =
+                ContractAbi::from_json(&serde_json::json!([declaration]).to_string()).unwrap();
+            let value = match ty {
+                "core::integer::u256" => AbiValue::Struct(BTreeMap::from([
+                    ("low".into(), AbiValue::Felt(Felt::ZERO)),
+                    ("high".into(), AbiValue::Felt(Felt::ZERO)),
+                ])),
+                "core::bool" => AbiValue::Bool(false),
+                "core::felt252" => AbiValue::Felt(Felt::ZERO),
+                _ => AbiValue::Bytes(vec![]),
+            };
+            for _ in 0..2 {
+                assert_eq!(
+                    abi.encode_value(ty, &value).unwrap_err().to_string(),
+                    expected
+                );
+                let input = [Felt::ZERO; 3];
+                let mut data = input.as_slice();
+                assert_eq!(
+                    abi.decode_value(ty, &mut data).unwrap_err().to_string(),
+                    expected
+                );
+                assert_eq!(data, input.as_slice());
+                assert_eq!(
+                    abi.encode_value(
+                        &format!("core::array::Array::<{ty}>"),
+                        &AbiValue::Sequence(vec![])
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn valid_declared_builtins_keep_their_special_wire_encodings() {
+        let abi = ContractAbi::from_json(r#"[{"type":"enum","name":"core::bool","variants":[{"name":"False","type":"()"},{"name":"True","type":"()"}]},{"type":"struct","name":"core::byte_array::ByteArray","members":[{"name":"data","type":"core::array::Array::<core::bytes_31::bytes31>"},{"name":"pending_word","type":"core::felt252"},{"name":"pending_word_len","type":"core::integer::u32"}]}]"#).unwrap();
+        for (ty, value, wire) in [
+            ("core::bool", AbiValue::Bool(true), vec![Felt::ONE]),
+            (
+                "core::byte_array::ByteArray",
+                AbiValue::Bytes(vec![b'a']),
+                vec![Felt::ZERO, Felt::from(b'a'), Felt::ONE],
+            ),
+        ] {
+            assert_eq!(abi.encode_value(ty, &value).unwrap(), wire);
+            let mut data = wire.as_slice();
+            assert_eq!(abi.decode_value(ty, &mut data).unwrap(), value);
+            assert_eq!(data, [] as [Felt; 0]);
+        }
     }
     #[test]
     fn contract_populates_u256_in_cairo_order() {
