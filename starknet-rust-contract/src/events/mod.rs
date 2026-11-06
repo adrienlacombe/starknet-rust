@@ -9,7 +9,7 @@ use starknet_rust_core::{
 use std::collections::{BTreeMap, BTreeSet};
 mod value;
 pub use value::{EventDecodeError, EventValue};
-use value::{EventTypes, charge_node, error};
+use value::{EventTypes, NodeBudget, charge_node, error};
 
 /// A decoded event with its ABI path and named fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,12 +159,12 @@ impl EventDecoder {
     }
     /// Decodes an event, rejecting unknown selectors, truncation and trailing keys/data.
     pub fn decode(&self, event: &Event) -> Result<DecodedEvent, EventDecodeError> {
-        self.decode_with_budget(event, &mut 1_000_000)
+        self.decode_with_budget(event, &mut NodeBudget::new(1_000_000))
     }
     fn decode_with_budget(
         &self,
         event: &Event,
-        budget: &mut usize,
+        budget: &mut NodeBudget,
     ) -> Result<DecodedEvent, EventDecodeError> {
         let mut matches = vec![];
         let mut candidate_error = None;
@@ -174,7 +174,7 @@ impl EventDecoder {
                 let mut data = event.data.as_slice();
                 let fields = match self.fields(&route.ty, &mut keys, &mut data, 0, budget) {
                     Ok(fields) => fields,
-                    Err(error) if *budget == 0 => return Err(error),
+                    Err(error) if budget.exceeded => return Err(error),
                     Err(error) => {
                         candidate_error.get_or_insert(error);
                         continue;
@@ -216,7 +216,7 @@ impl EventDecoder {
         keys: &mut &[Felt],
         data: &mut &[Felt],
         depth: usize,
-        budget: &mut usize,
+        budget: &mut NodeBudget,
     ) -> Result<BTreeMap<String, EventValue>, EventDecodeError> {
         charge_node(budget)?;
         if depth > 64 {
@@ -343,6 +343,44 @@ mod tests {
         .unwrap();
         assert_eq!(
             decoder.decode(&event).unwrap_err().to_string(),
+            "ambiguous event"
+        );
+    }
+    #[test]
+    fn exact_budget_boundary_does_not_turn_schema_failure_into_exhaustion() {
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"key"}]},{"type":"event","name":"B","kind":"struct","members":[{"name":"value","type":"Unknown","kind":"data"}]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap()],
+            data: vec![],
+        };
+        // A's root and value consume two nodes. B's root consumes the third node,
+        // then its schema fails without asking to decode another value node.
+        let mut budget = NodeBudget::new(3);
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap()
+                .path,
+            vec!["A"]
+        );
+        assert_eq!(budget.remaining, 0);
+        assert!(!budget.exceeded);
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut NodeBudget::new(2))
+                .unwrap_err()
+                .to_string(),
+            "decoded values exceed node budget"
+        );
+        // With a valid unit payload, both routes can succeed exactly at the boundary.
+        let decoder = EventDecoder::from_json(&abi.replace("Unknown", "()"), "Root").unwrap();
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut NodeBudget::new(4))
+                .unwrap_err()
+                .to_string(),
             "ambiguous event"
         );
     }
@@ -561,7 +599,7 @@ mod tests {
             keys: vec![],
             data: vec![],
         };
-        let mut budget = 15;
+        let mut budget = NodeBudget::new(15);
         assert!(
             decoder
                 .decode_with_budget(&event, &mut budget)
@@ -569,15 +607,27 @@ mod tests {
                 .0
                 .contains("node budget")
         );
-        assert_eq!(budget, 0);
-        assert!(decoder.decode_with_budget(&event, &mut 63).is_ok());
+        assert_eq!(budget.remaining, 0);
+        assert!(
+            decoder
+                .decode_with_budget(&event, &mut NodeBudget::new(63))
+                .is_ok()
+        );
         let decoder = EventDecoder::from_json(r#"[{"type":"event","name":"Outer","kind":"struct","members":[{"name":"inner","type":"Inner","kind":"flat"},{"name":"items","type":"core::array::Array::<()>","kind":"data"}]},{"type":"event","name":"Inner","kind":"struct","members":[]}]"#, "Outer").unwrap();
         let event = Event {
             data: vec![Felt::ONE],
             ..event
         };
-        assert!(decoder.decode_with_budget(&event, &mut 3).is_err());
-        assert!(decoder.decode_with_budget(&event, &mut 4).is_ok());
+        assert!(
+            decoder
+                .decode_with_budget(&event, &mut NodeBudget::new(3))
+                .is_err()
+        );
+        assert!(
+            decoder
+                .decode_with_budget(&event, &mut NodeBudget::new(4))
+                .is_ok()
+        );
     }
     #[test]
     fn ordinary_duplicate_struct_fields_cannot_be_decoded_as_a_valid_event() {

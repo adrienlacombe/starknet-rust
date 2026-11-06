@@ -35,10 +35,26 @@ pub(super) fn error(message: impl Into<String>) -> EventDecodeError {
     EventDecodeError(message.into())
 }
 
-pub(super) fn charge_node(budget: &mut usize) -> Result<(), EventDecodeError> {
-    *budget = budget
-        .checked_sub(1)
-        .ok_or_else(|| error("decoded values exceed node budget"))?;
+pub(super) struct NodeBudget {
+    pub(super) remaining: usize,
+    pub(super) exceeded: bool,
+}
+impl NodeBudget {
+    pub(super) const fn new(remaining: usize) -> Self {
+        Self {
+            remaining,
+            exceeded: false,
+        }
+    }
+}
+pub(super) fn charge_node(budget: &mut NodeBudget) -> Result<(), EventDecodeError> {
+    let Some(remaining) = budget.remaining.checked_sub(1) else {
+        // Reaching exactly zero is valid. Only a failed charge means a candidate
+        // could not be inspected, so earlier matches cannot safely be returned.
+        budget.exceeded = true;
+        return Err(error("decoded values exceed node budget"));
+    };
+    budget.remaining = remaining;
     Ok(())
 }
 
@@ -81,7 +97,7 @@ impl EventTypes {
         &self,
         ty: &str,
         data: &mut &[Felt],
-        budget: &mut usize,
+        budget: &mut NodeBudget,
     ) -> Result<EventValue, EventDecodeError> {
         self.validate_type(ty)?;
         self.decode(ty, data, 0, budget)
@@ -174,7 +190,7 @@ impl EventTypes {
         ty: &str,
         data: &mut &[Felt],
         depth: usize,
-        budget: &mut usize,
+        budget: &mut NodeBudget,
     ) -> Result<EventValue, EventDecodeError> {
         charge_node(budget)?;
         if depth > 64 {
@@ -362,7 +378,11 @@ mod tests {
             for ty in ["core::array::Array::<Node>", "Node"] {
                 assert!(
                     types
-                        .decode_value(ty, &mut [Felt::ZERO].as_slice(), &mut 1_000_000)
+                        .decode_value(
+                            ty,
+                            &mut [Felt::ZERO].as_slice(),
+                            &mut NodeBudget::new(1_000_000)
+                        )
                         .is_err()
                 );
             }
@@ -392,14 +412,18 @@ mod tests {
                     .decode_value(
                         "core::array::Array::<Large>",
                         &mut [Felt::ZERO].as_slice(),
-                        &mut 1_000_000
+                        &mut NodeBudget::new(1_000_000)
                     )
                     .unwrap(),
                 EventValue::Sequence(vec![])
             );
             assert!(
                 types
-                    .decode_value("Unknown", &mut [].as_slice(), &mut 1_000_000)
+                    .decode_value(
+                        "Unknown",
+                        &mut [].as_slice(),
+                        &mut NodeBudget::new(1_000_000)
+                    )
                     .is_err()
             );
         }
@@ -424,7 +448,11 @@ mod tests {
         ] {
             assert!(
                 types
-                    .decode_value(ty, &mut [Felt::ZERO].as_slice(), &mut 1_000_000)
+                    .decode_value(
+                        ty,
+                        &mut [Felt::ZERO].as_slice(),
+                        &mut NodeBudget::new(1_000_000)
+                    )
                     .is_err(),
                 "{ty}"
             );
@@ -435,7 +463,7 @@ mod tests {
                 .decode_value(
                     "core::array::Array::<Node>",
                     &mut [Felt::ZERO].as_slice(),
-                    &mut 1_000_000
+                    &mut NodeBudget::new(1_000_000)
                 )
                 .unwrap(),
             EventValue::Sequence(vec![])
@@ -445,7 +473,7 @@ mod tests {
                 .decode_value(
                     "Node",
                     &mut [Felt::ZERO, Felt::THREE].as_slice(),
-                    &mut 1_000_000
+                    &mut NodeBudget::new(1_000_000)
                 )
                 .unwrap(),
             EventValue::Struct(BTreeMap::from([
@@ -459,11 +487,15 @@ mod tests {
         let types = EventTypes::new(serde_json::from_str(r#"[{"type":"struct","name":"Bad","members":[{"name":"x","type":"core::integer::u8"},{"name":"x","type":"core::integer::u8"}]},{"type":"enum","name":"BadEnum","variants":[{"name":"A","type":"core::integer::u8"},{"name":"A","type":"core::integer::u8"}]}]"#).unwrap());
         let data = [Felt::ONE, Felt::TWO];
         let mut input = data.as_slice();
-        assert!(types.decode_value("Bad", &mut input, &mut 100).is_err());
+        assert!(
+            types
+                .decode_value("Bad", &mut input, &mut NodeBudget::new(100))
+                .is_err()
+        );
         assert_eq!(input, data.as_slice());
         assert!(
             types
-                .decode_value("BadEnum", &mut data.as_slice(), &mut 100)
+                .decode_value("BadEnum", &mut data.as_slice(), &mut NodeBudget::new(100))
                 .is_err()
         );
     }
@@ -507,7 +539,7 @@ mod tests {
                 for _ in 0..2 {
                     let input = [Felt::ZERO; 3];
                     let mut data = input.as_slice();
-                    let mut budget = 100;
+                    let mut budget = NodeBudget::new(100);
                     assert_eq!(
                         types
                             .decode_value(&root, &mut data, &mut budget)
@@ -516,7 +548,8 @@ mod tests {
                         expected
                     );
                     assert_eq!(data, input.as_slice());
-                    assert_eq!(budget, 100);
+                    assert_eq!(budget.remaining, 100);
+                    assert!(!budget.exceeded);
                 }
             }
         }
@@ -533,7 +566,12 @@ mod tests {
             ),
         ] {
             let mut data = wire.as_slice();
-            assert_eq!(types.decode_value(ty, &mut data, &mut 100).unwrap(), value);
+            assert_eq!(
+                types
+                    .decode_value(ty, &mut data, &mut NodeBudget::new(100))
+                    .unwrap(),
+                value
+            );
             assert_eq!(data, [] as [Felt; 0]);
         }
     }
@@ -547,7 +585,7 @@ mod tests {
                     "core::array::Array::<core::array::Array::<()>>",
                     &mut data.as_slice(),
                     0,
-                    &mut 10
+                    &mut NodeBudget::new(10)
                 )
                 .is_err()
         );
