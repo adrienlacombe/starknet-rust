@@ -58,17 +58,42 @@ pub struct ContractAbi {
 }
 impl ContractAbi {
     /// Creates an ABI, expanding interface entries. Duplicates within the function namespace or ordinary type namespace are rejected; functions and types may share a name.
+    /// Interface nesting is limited to 64; owned input is consumed without recursive traversal or cleanup.
     pub fn new(entries: Vec<AbiEntry>) -> Result<Self, AbiError> {
-        fn flatten(entries: Vec<AbiEntry>, out: &mut Vec<AbiEntry>) {
-            for e in entries {
-                match e {
-                    AbiEntry::Interface(i) => flatten(i.items, out),
-                    e => out.push(e),
+        fn flatten(entries: Vec<AbiEntry>, out: &mut Vec<AbiEntry>) -> bool {
+            let mut pending: Vec<_> = entries
+                .into_iter()
+                .rev()
+                .map(|entry| (entry, 0usize))
+                .collect();
+            let mut exceeded = false;
+            while let Some((entry, depth)) = pending.pop() {
+                match entry {
+                    AbiEntry::Interface(interface) => {
+                        exceeded |= depth >= 64;
+                        pending.extend(
+                            interface
+                                .items
+                                .into_iter()
+                                .rev()
+                                .map(|entry| (entry, depth.saturating_add(1))),
+                        );
+                    }
+                    entry => {
+                        if !exceeded {
+                            out.push(entry);
+                        }
+                    }
                 }
+                // Even after a violation, drain every owned interface subtree iteratively.
+                // Returning early would recursively drop an unprocessed deep subtree.
             }
+            exceeded
         }
         let mut flattened = vec![];
-        flatten(entries, &mut flattened);
+        if flatten(entries, &mut flattened) {
+            return Err(error("ABI interface nesting exceeds 64"));
+        }
         let mut names = std::collections::BTreeSet::new();
         let mut type_indices = BTreeMap::new();
         let mut function_indices = BTreeMap::new();
@@ -676,6 +701,73 @@ impl std::error::Error for ContractCallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn nested_interfaces(mut entry: AbiEntry, depth: usize) -> AbiEntry {
+        for _ in 0..depth {
+            entry = AbiEntry::Interface(starknet_rust_core::types::contract::AbiInterface {
+                name: "Interface".into(),
+                items: vec![entry],
+            });
+        }
+        entry
+    }
+    fn empty_struct(name: &str) -> AbiEntry {
+        AbiEntry::Struct(starknet_rust_core::types::contract::AbiStruct {
+            name: name.into(),
+            members: vec![],
+        })
+    }
+    #[test]
+    fn interface_flattening_preserves_order_and_enforces_its_depth_boundary() {
+        let abi = ContractAbi::new(vec![
+            empty_struct("Before"),
+            nested_interfaces(empty_struct("Leaf"), 64),
+            empty_struct("After"),
+        ])
+        .unwrap();
+        let names: Vec<_> = abi
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                AbiEntry::Struct(definition) => definition.name.as_str(),
+                _ => panic!("unexpected flattened entry"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Before", "Leaf", "After"]);
+        assert_eq!(
+            ContractAbi::new(vec![nested_interfaces(empty_struct("Leaf"), 65)])
+                .unwrap_err()
+                .to_string(),
+            "ABI interface nesting exceeds 64"
+        );
+        let empty = AbiEntry::Interface(starknet_rust_core::types::contract::AbiInterface {
+            name: "Empty".into(),
+            items: vec![],
+        });
+        assert_eq!(
+            ContractAbi::new(vec![nested_interfaces(empty, 64)])
+                .unwrap_err()
+                .to_string(),
+            "ABI interface nesting exceeds 64"
+        );
+    }
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn deeply_nested_owned_interfaces_are_drained_without_recursive_drops() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let entries = (0..2)
+                    .map(|_| nested_interfaces(empty_struct("Leaf"), 20_000))
+                    .collect();
+                assert_eq!(
+                    ContractAbi::new(entries).unwrap_err().to_string(),
+                    "ABI interface nesting exceeds 64"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
     #[derive(Debug)]
     struct MockTransport;
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
