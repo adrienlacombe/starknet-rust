@@ -9,7 +9,7 @@ use starknet_rust_core::{
 use std::collections::{BTreeMap, BTreeSet};
 mod value;
 pub use value::{EventDecodeError, EventValue};
-use value::{EventTypes, NodeBudget, charge_node, error};
+use value::{EventTypes, NodeBudget, SchemaBudget, charge_node, error};
 
 /// A decoded event with its ABI path and named fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +45,10 @@ impl std::fmt::Debug for EventDecoder {
             .field("routes", &self.routes)
             .finish_non_exhaustive()
     }
+}
+struct RouteBudget {
+    remaining: usize,
+    resources: SchemaBudget,
 }
 impl EventDecoder {
     /// Creates a decoder and rejects unknown event types, cycles, and ambiguous selector paths.
@@ -126,6 +130,9 @@ impl EventDecoder {
             types,
             routes: vec![],
         };
+        let mut resources = SchemaBudget::new(1_000_000);
+        resources.charge_text(root.len())?;
+        resources.charge_owned(root.len())?;
         let is_untyped = matches!(Self::event(&decoder.types, root)?, AbiEvent::Untyped(_));
         Self::collect_routes(
             &decoder.types,
@@ -138,7 +145,10 @@ impl EventDecoder {
             },
             vec![],
             &mut vec![],
-            &mut 4096,
+            &mut RouteBudget {
+                remaining: 4096,
+                resources,
+            },
         )?;
         let mut paths = BTreeSet::new();
         if decoder
@@ -174,9 +184,14 @@ impl EventDecoder {
         selectors: Vec<Felt>,
         path: Vec<String>,
         stack: &mut Vec<String>,
-        budget: &mut usize,
+        budget: &mut RouteBudget,
     ) -> Result<(), EventDecodeError> {
-        *budget = budget
+        budget.resources.charge_text(ty.len())?;
+        budget
+            .resources
+            .charge_owned(ty.len() + std::mem::size_of::<String>())?;
+        budget.remaining = budget
+            .remaining
             .checked_sub(1)
             .ok_or_else(|| error("event ABI traversal exceeds 4096 nodes"))?;
         if routes.len() >= 4096 {
@@ -188,25 +203,35 @@ impl EventDecoder {
         stack.push(ty.into());
         // ABI definitions stay in one immutable store. Only route metadata is
         // copied; a large leaf shared by many aliases is never cloned per visit.
-        match Self::event(types, ty)? {
-            AbiEvent::Typed(TypedAbiEvent::Enum(e)) => {
-                for v in &e.variants {
-                    let mut selectors = selectors.clone();
-                    match v.kind {
-                        EventFieldKind::Nested => selectors.push(selector(&v.name)?),
-                        EventFieldKind::Flat => {}
-                        _ => return Err(error("event enum variants must be nested or flat")),
-                    }
-                    let mut path = path.clone();
-                    path.push(v.name.clone());
-                    Self::collect_routes(types, routes, &v.r#type, selectors, path, stack, budget)?;
+        if let AbiEvent::Typed(TypedAbiEvent::Enum(e)) = Self::event(types, ty)? {
+            for v in &e.variants {
+                budget.resources.charge_text(v.name.len())?;
+                budget.resources.charge_owned(
+                    path.iter()
+                        .map(|name| name.len().saturating_add(std::mem::size_of::<String>()))
+                        .sum::<usize>()
+                        .saturating_add(v.name.len())
+                        .saturating_add(std::mem::size_of::<String>()),
+                )?;
+                let mut selectors = selectors.clone();
+                match v.kind {
+                    EventFieldKind::Nested => selectors.push(selector(&v.name)?),
+                    EventFieldKind::Flat => {}
+                    _ => return Err(error("event enum variants must be nested or flat")),
                 }
+                let mut path = path.clone();
+                path.push(v.name.clone());
+                Self::collect_routes(types, routes, &v.r#type, selectors, path, stack, budget)?;
             }
-            _ => routes.push(Route {
+        } else {
+            budget
+                .resources
+                .charge_owned(ty.len().saturating_add(2 * std::mem::size_of::<Route>()))?;
+            routes.push(Route {
                 selectors,
                 path,
                 ty: ty.into(),
-            }),
+            });
         }
         stack.pop();
         Ok(())
@@ -237,6 +262,17 @@ impl EventDecoder {
                 if keys.is_empty() && data.is_empty() {
                     if matched.is_some() {
                         return Err(error("ambiguous event"));
+                    }
+                    budget.schema.charge_owned(
+                        route
+                            .ty
+                            .len()
+                            .saturating_add(2 * std::mem::size_of::<DecodedEvent>()),
+                    )?;
+                    for name in &route.path {
+                        budget.schema.charge_owned(
+                            name.len().saturating_add(std::mem::size_of::<String>()),
+                        )?;
                     }
                     matched = Some(DecodedEvent {
                         from_address: event.from_address,
@@ -286,6 +322,10 @@ impl EventDecoder {
         budget: &mut NodeBudget,
     ) -> Result<BTreeMap<String, EventValue>, EventDecodeError> {
         charge_node(budget)?;
+        budget.schema.charge_text(ty.len())?;
+        budget
+            .schema
+            .charge_owned(2 * std::mem::size_of::<BTreeMap<String, EventValue>>())?;
         if depth > 64 {
             return Err(error("event nesting exceeds 64"));
         }
@@ -293,6 +333,10 @@ impl EventDecoder {
         match Self::event(&self.types, ty)? {
             AbiEvent::Untyped(e) => {
                 for m in &e.inputs {
+                    budget.schema.charge_text(m.name.len())?;
+                    budget
+                        .schema
+                        .charge_owned(m.name.len().saturating_add(std::mem::size_of::<String>()))?;
                     if fields
                         .insert(
                             m.name.clone(),
@@ -306,6 +350,10 @@ impl EventDecoder {
             }
             AbiEvent::Typed(TypedAbiEvent::Struct(e)) => {
                 for m in &e.members {
+                    budget.schema.charge_text(m.name.len())?;
+                    budget
+                        .schema
+                        .charge_owned(m.name.len().saturating_add(std::mem::size_of::<String>()))?;
                     let value = match m.kind {
                         EventFieldKind::Key => self.types.decode_value(&m.r#type, keys, budget)?,
                         EventFieldKind::Data => self.types.decode_value(&m.r#type, data, budget)?,
@@ -348,6 +396,96 @@ fn event_name(e: &AbiEvent) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logical_byte_limits_cover_event_metadata_and_aggregate_empty_receipts() {
+        let name = "e".repeat(256);
+        let abi = serde_json::json!([{"type":"event","name":name,"kind":"struct","members":[]}])
+            .to_string();
+        let decoder = EventDecoder::from_json(&abi, &name).unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![],
+            data: vec![],
+        };
+        let mut budget = NodeBudget::new(100);
+        budget.schema.owned = 256;
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert!(budget.schema.exceeded);
+        let events = vec![event; 8];
+        let mut budget = NodeBudget::new(100);
+        budget.schema.owned = 1_024;
+        assert_eq!(
+            decoder
+                .decode_from_with_budget(&events, Felt::ONE, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert!(budget.schema.exceeded);
+        assert_eq!(decoder.decode_from(&events, Felt::ONE).unwrap().len(), 8);
+        let mut resources = SchemaBudget::new(1_000_000);
+        resources.owned = 256;
+        assert_eq!(
+            EventDecoder::collect_routes(
+                &decoder.types,
+                &mut vec![],
+                &name,
+                vec![],
+                vec![],
+                &mut vec![],
+                &mut RouteBudget {
+                    remaining: 4096,
+                    resources
+                }
+            )
+            .unwrap_err()
+            .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+    }
+    #[test]
+    fn allocation_exhaustion_cannot_hide_an_uninspected_candidate() {
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"key"}]},{"type":"event","name":"B","kind":"struct","members":[{"name":"value","type":"()","kind":"data"}]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap()],
+            data: vec![],
+        };
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "ambiguous event"
+        );
+        let mut consumed = None;
+        // Find the small exact allowance needed for A alone, without hard-coding layouts.
+        let a_decoder = EventDecoder::from_json(abi, "A").unwrap();
+        for _ in 0..2 {
+            let mut budget = NodeBudget::new(100);
+            a_decoder.decode_with_budget(&event, &mut budget).unwrap();
+            consumed = Some(64 * 1024 * 1024 - budget.schema.owned);
+        }
+        let mut budget = NodeBudget::new(100);
+        budget.schema.owned = consumed.unwrap() + 128;
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert!(budget.schema.exceeded);
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "ambiguous event"
+        );
+    }
+
     fn nested_interfaces(mut entry: AbiEntry, depth: usize) -> AbiEntry {
         for _ in 0..depth {
             entry = AbiEntry::Interface(starknet_rust_core::types::contract::AbiInterface {

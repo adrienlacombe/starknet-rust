@@ -35,17 +35,66 @@ pub(super) fn error(message: impl Into<String>) -> EventDecodeError {
     EventDecodeError(message.into())
 }
 
+#[derive(Debug)]
+struct SchemaCache {
+    results: BTreeMap<String, Result<(), EventDecodeError>>,
+    remaining: usize,
+}
+impl SchemaCache {
+    const fn new() -> Self {
+        Self {
+            results: BTreeMap::new(),
+            remaining: 64 * 1024 * 1024,
+        }
+    }
+    fn cache(
+        &mut self,
+        ty: &str,
+        result: &Result<(), EventDecodeError>,
+        budget: &mut SchemaBudget,
+    ) -> Result<(), EventDecodeError> {
+        // Cache capacity is optional, shared across operations, and accounted under
+        // the same write lock as insertion. Concurrent completed roots never double-charge.
+        if self.results.contains_key(ty) {
+            return Ok(());
+        }
+        let bytes = ty
+            .len()
+            .saturating_add(match result {
+                Ok(()) => 0,
+                Err(failure) => failure.0.len(),
+            })
+            .saturating_add(128);
+        if let Some(remaining) = self.remaining.checked_sub(bytes) {
+            budget.charge_owned(bytes)?;
+            self.results.insert(ty.to_owned(), result.clone());
+            self.remaining = remaining;
+        }
+        Ok(())
+    }
+}
+impl std::ops::Deref for SchemaCache {
+    type Target = BTreeMap<String, Result<(), EventDecodeError>>;
+    fn deref(&self) -> &Self::Target {
+        &self.results
+    }
+}
+
 // Per operation, cold schema traversal is bounded independently of decoded value nodes.
 const DEFAULT_SCHEMA_WORK: usize = 1_000_000;
 pub(super) struct SchemaBudget {
     pub(super) remaining: usize,
     pub(super) exceeded: bool,
+    pub(super) owned: usize,
+    pub(super) text: usize,
 }
 impl SchemaBudget {
-    const fn new(remaining: usize) -> Self {
+    pub(super) const fn new(remaining: usize) -> Self {
         Self {
             remaining,
             exceeded: false,
+            owned: 64 * 1024 * 1024,
+            text: 64 * 1024 * 1024,
         }
     }
     fn charge(&mut self) -> Result<(), EventDecodeError> {
@@ -54,6 +103,23 @@ impl SchemaBudget {
             return Err(error("ABI schema validation exceeds work budget"));
         }
         self.remaining -= 1;
+        Ok(())
+    }
+
+    pub(super) fn charge_owned(&mut self, count: usize) -> Result<(), EventDecodeError> {
+        let Some(remaining) = self.owned.checked_sub(count) else {
+            self.exceeded = true;
+            return Err(error("ABI logical allocation exceeds byte budget"));
+        };
+        self.owned = remaining;
+        Ok(())
+    }
+    pub(super) fn charge_text(&mut self, count: usize) -> Result<(), EventDecodeError> {
+        let Some(remaining) = self.text.checked_sub(count) else {
+            self.exceeded = true;
+            return Err(error("ABI type text exceeds work budget"));
+        };
+        self.text = remaining;
         Ok(())
     }
 }
@@ -92,7 +158,7 @@ pub(super) struct EventTypes {
     pub(super) event_indices: BTreeMap<String, usize>,
     #[cfg(test)]
     schema_passes: std::sync::atomic::AtomicUsize,
-    schema_results: RwLock<BTreeMap<String, Result<(), EventDecodeError>>>,
+    schema_results: RwLock<SchemaCache>,
 }
 impl EventTypes {
     pub(super) fn new(entries: Vec<AbiEntry>) -> Self {
@@ -118,7 +184,7 @@ impl EventTypes {
             event_indices,
             #[cfg(test)]
             schema_passes: std::sync::atomic::AtomicUsize::new(0),
-            schema_results: RwLock::new(BTreeMap::new()),
+            schema_results: RwLock::new(SchemaCache::new()),
         }
     }
     pub(super) fn decode_value(
@@ -135,6 +201,7 @@ impl EventTypes {
     // named schemas without revisiting cycles; value depth/node limits still apply separately.
     fn validate_type(&self, ty: &str, budget: &mut SchemaBudget) -> Result<(), EventDecodeError> {
         budget.charge()?;
+        budget.charge_text(ty.len().saturating_mul(4))?;
         let ty = ty.trim();
         if let Some(result) = self
             .schema_results
@@ -142,6 +209,10 @@ impl EventTypes {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(ty)
         {
+            if let Err(failure) = result {
+                budget.charge_owned(failure.0.len())?;
+                budget.charge_text(failure.0.len())?;
+            }
             return result.clone();
         }
         #[cfg(test)]
@@ -153,7 +224,7 @@ impl EventTypes {
             self.schema_results
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(ty.to_owned(), result.clone());
+                .cache(ty, &result, budget)?;
         }
         result
     }
@@ -165,10 +236,16 @@ impl EventTypes {
         budget: &mut SchemaBudget,
     ) -> Result<(), EventDecodeError> {
         budget.charge()?;
+        budget.charge_text(ty.len().saturating_mul(4))?;
         if depth > 64 {
             return Err(error("ABI type nesting exceeds 64"));
         }
         let ty = ty.trim();
+        budget.charge_owned(
+            ty.len()
+                .saturating_mul(2)
+                .saturating_add(std::mem::size_of::<String>()),
+        )?;
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
@@ -180,6 +257,7 @@ impl EventTypes {
                 let mut names = std::collections::BTreeSet::new();
                 for member in &definition.members {
                     budget.charge()?;
+                    budget.charge_text(member.name.len())?;
                     if !names.insert(&member.name) {
                         return Err(error("duplicate ABI struct member"));
                     }
@@ -191,6 +269,7 @@ impl EventTypes {
                 let mut names = std::collections::BTreeSet::new();
                 for variant in &definition.variants {
                     budget.charge()?;
+                    budget.charge_text(variant.name.len())?;
                     if !names.insert(&variant.name) {
                         return Err(error("duplicate ABI enum variant"));
                     }
@@ -243,6 +322,11 @@ impl EventTypes {
         if depth > 64 {
             return Err(error("ABI nesting exceeds 64"));
         }
+        budget.schema.charge_text(ty.len().saturating_mul(4))?;
+        budget.schema.charge_owned(
+            ty.len()
+                .saturating_add(2 * std::mem::size_of::<EventValue>()),
+        )?;
         let ty = ty.trim();
         if let Some(inner) = ty.strip_prefix('@') {
             return self.decode(inner, data, depth + 1, budget);
@@ -255,6 +339,9 @@ impl EventTypes {
         if ty == "core::integer::u256" {
             let mut fields = BTreeMap::new();
             for name in ["low", "high"] {
+                budget
+                    .schema
+                    .charge_owned(name.len() + std::mem::size_of::<String>())?;
                 fields.insert(
                     name.to_owned(),
                     self.decode("core::integer::u128", data, depth + 1, budget)?,
@@ -288,6 +375,7 @@ impl EventTypes {
                 .checked_mul(31)
                 .and_then(|size| size.checked_add(pending_len))
                 .ok_or_else(|| error("ByteArray size overflow"))?;
+            budget.schema.charge_owned(capacity)?;
             let mut bytes = Vec::with_capacity(capacity);
             for _ in 0..n {
                 let word = take(data)?.to_bytes_be();
@@ -321,7 +409,6 @@ impl EventTypes {
         }
         if let Some(types) = tuple_types(ty)? {
             return types
-                .iter()
                 .map(|t| self.decode(t, data, depth + 1, budget))
                 .collect::<Result<Vec<_>, _>>()
                 .map(EventValue::Sequence);
@@ -331,6 +418,10 @@ impl EventTypes {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut values = BTreeMap::new();
                     for m in &s.members {
+                        budget.schema.charge_text(m.name.len())?;
+                        budget.schema.charge_owned(
+                            m.name.len().saturating_add(std::mem::size_of::<String>()),
+                        )?;
                         values.insert(
                             m.name.clone(),
                             self.decode(&m.r#type, data, depth + 1, budget)?,
@@ -344,6 +435,7 @@ impl EventTypes {
                         .variants
                         .get(index)
                         .ok_or_else(|| error("invalid enum discriminant"))?;
+                    budget.schema.charge_owned(v.name.len())?;
                     return Ok(EventValue::Enum {
                         variant: v.name.clone(),
                         value: Box::new(self.decode(&v.r#type, data, depth + 1, budget)?),
@@ -384,32 +476,54 @@ fn array_inner(ty: &str) -> Option<&str> {
         .iter()
         .find_map(|p| ty.strip_prefix(p).and_then(|t| t.strip_suffix('>')))
 }
-fn tuple_types(ty: &str) -> Result<Option<Vec<&str>>, EventDecodeError> {
+#[derive(Clone)]
+struct TupleTypes<'a> {
+    inner: &'a str,
+}
+impl<'a> Iterator for TupleTypes<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.inner.is_empty() {
+            return None;
+        }
+        let mut depth = 0usize;
+        for (index, character) in self.inner.char_indices() {
+            match character {
+                '(' | '<' | '[' => depth += 1,
+                ')' | '>' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    let field = self.inner[..index].trim();
+                    self.inner = &self.inner[index + 1..];
+                    return Some(field);
+                }
+                _ => {}
+            }
+        }
+        let field = self.inner.trim();
+        self.inner = "";
+        Some(field)
+    }
+}
+fn tuple_types(ty: &str) -> Result<Option<TupleTypes<'_>>, EventDecodeError> {
     if !ty.starts_with('(') {
         return Ok(None);
     }
     let inner = ty
         .strip_prefix('(')
-        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|text| text.strip_suffix(')'))
         .ok_or_else(|| error("malformed tuple type"))?;
-    if inner.trim().is_empty() {
-        return Ok(Some(vec![]));
-    }
-    let mut depth = 0i32;
-    let mut start = 0;
-    let mut fields = vec![];
-    for (i, c) in inner.char_indices() {
-        match c {
-            '(' | '<' | '[' => depth += 1,
-            ')' | '>' | ']' => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(error("malformed tuple type"));
-                }
+    let mut depth = 0usize;
+    for character in inner.chars() {
+        match character {
+            '(' | '<' | '[' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| error("malformed tuple type"))?;
             }
-            ',' if depth == 0 => {
-                fields.push(inner[start..i].trim());
-                start = i + 1;
+            ')' | '>' | ']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| error("malformed tuple type"))?;
             }
             _ => {}
         }
@@ -417,11 +531,9 @@ fn tuple_types(ty: &str) -> Result<Option<Vec<&str>>, EventDecodeError> {
     if depth != 0 {
         return Err(error("malformed tuple type"));
     }
-    let tail = inner[start..].trim();
-    if !tail.is_empty() {
-        fields.push(tail);
-    }
-    Ok(Some(fields))
+    Ok(Some(TupleTypes {
+        inner: inner.trim(),
+    }))
 }
 fn take(data: &mut &[Felt]) -> Result<Felt, EventDecodeError> {
     let (first, rest) = data
@@ -437,6 +549,141 @@ fn length(value: Felt) -> Result<usize, EventDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn text_exhaustion_and_cached_diagnostic_copy_cannot_poison_structural_results() {
+        let unknown = "Unknown".repeat(64);
+        let json = serde_json::json!([{"type":"struct","name":"S","members":[{"name":"field","type":unknown}]}]).to_string();
+        let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
+        let mut budget = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        budget.text = 16;
+        assert_eq!(
+            codec
+                .validate_type("S", &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI type text exceeds work budget"
+        );
+        assert!(budget.exceeded);
+        assert_eq!(codec.schema_results.read().unwrap().len(), 0);
+        let expected = format!("unsupported type: {unknown}");
+        assert_eq!(
+            codec
+                .validate_type("S", &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        let mut budget = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        budget.owned = 16;
+        assert_eq!(
+            codec
+                .validate_type("S", &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert!(budget.exceeded);
+        assert_eq!(
+            codec
+                .validate_type("S", &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn logical_byte_limit_bounds_repeated_owned_member_and_variant_names() {
+        let long = "x".repeat(256);
+        for declaration in [
+            serde_json::json!({"type":"struct","name":"S","members":[{"name":long,"type":"()"}]}),
+            serde_json::json!({"type":"enum","name":"S","variants":[{"name":long,"type":"()"}]}),
+        ] {
+            let is_enum = declaration["type"] == "enum";
+            let json = serde_json::json!([declaration]).to_string();
+            let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
+            let root = "core::array::Array::<S>".to_owned();
+            let data = if is_enum {
+                vec![
+                    Felt::from(4u64),
+                    Felt::ZERO,
+                    Felt::ZERO,
+                    Felt::ZERO,
+                    Felt::ZERO,
+                ]
+            } else {
+                vec![Felt::from(4u64)]
+            };
+            assert!(
+                matches!(codec.decode_value(&root, &mut data.as_slice(), &mut NodeBudget::new(100)).unwrap(), EventValue::Sequence(values) if values.len() == 4)
+            );
+            let mut resources = NodeBudget::new(100);
+            resources.schema.owned = 512;
+            assert_eq!(
+                codec
+                    .decode_value(&root, &mut data.as_slice(), &mut resources)
+                    .unwrap_err()
+                    .to_string(),
+                "ABI logical allocation exceeds byte budget"
+            );
+            assert!(resources.schema.exceeded);
+            assert!(
+                matches!(codec.decode_value(&root, &mut data.as_slice(), &mut NodeBudget::new(100)).unwrap(), EventValue::Sequence(values) if values.len() == 4)
+            );
+        }
+    }
+    #[test]
+    fn repeated_borrowed_tuple_parsing_obeys_text_work_limit() {
+        let json = "[]".to_owned();
+        let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
+        let root = format!("core::array::Array::<((),{}())>", " ".repeat(512));
+        let data = [Felt::from(3u64)];
+        assert!(
+            matches!(codec.decode_value(&root, &mut data.as_slice(), &mut NodeBudget::new(100)).unwrap(), EventValue::Sequence(values) if values.len() == 3)
+        );
+        let mut resources = NodeBudget::new(100);
+        resources.schema.text = 7_500;
+        assert_eq!(
+            codec
+                .decode_value(&root, &mut data.as_slice(), &mut resources)
+                .unwrap_err()
+                .to_string(),
+            "ABI type text exceeds work budget"
+        );
+        assert!(resources.schema.exceeded);
+        assert!(
+            matches!(codec.decode_value(&root, &mut data.as_slice(), &mut NodeBudget::new(100)).unwrap(), EventValue::Sequence(values) if values.len() == 3)
+        );
+        for malformed in ["(()", "())", "((),<)", "((),>)"] {
+            assert!(tuple_types(malformed).is_err());
+        }
+        assert_eq!(tuple_types(" ( )".trim()).unwrap().unwrap().count(), 0);
+        assert_eq!(
+            tuple_types("((), (), )")
+                .unwrap()
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec!["()", "()"]
+        );
+    }
+    #[test]
+    fn full_optional_schema_cache_does_not_reject_valid_values() {
+        let json = r#"[{"type":"struct","name":"S","members":[]}]"#.to_owned();
+        let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
+        codec.schema_results.write().unwrap().remaining = 0;
+        let root = "S".to_owned();
+        let data: [Felt; 0] = [];
+        for _ in 0..2 {
+            assert_eq!(
+                codec
+                    .decode_value(&root, &mut data.as_slice(), &mut NodeBudget::new(100))
+                    .unwrap(),
+                EventValue::Struct(BTreeMap::new())
+            );
+        }
+        assert_eq!(codec.schema_results.read().unwrap().len(), 0);
+    }
+
     #[test]
     fn cached_recursive_schema_errors_propagate_and_decoder_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}

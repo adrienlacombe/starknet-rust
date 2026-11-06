@@ -35,3 +35,16 @@ decoding stops on exhaustion even if an earlier candidate matched.
 
 Array counts above one million are terminal resource exhaustion, including counts too large for
 the native or WASM host integer size; an earlier matching candidate cannot hide this abort.
+
+Operations additionally enforce independent 64 MiB allowances for logical owned storage and
+type-text work. Logical accounting includes value/container slots, copied identifiers and
+diagnostics, ByteArray/encoded buffers, and schema temporaries; it is not an exact allocator
+or process-memory measurement. Type text is charged before repeated parsing or name searches.
+Tuple fields are traversed with a borrowed iterator, without eager per-value field vectors.
+The immutable loaded ABI/indexes and caller-owned input values/felts form the storage baseline
+outside these allowances.
+Completed schema-cache entries have a separate shared 64 MiB logical capacity; a full cache
+skips optional insertions while valid decoding continues. Resource failures are not cached.
+Candidates and receipt outputs share allowances, including empty events and route metadata;
+existing decoded-value node limits remain per event. Route construction also bounds copied
+metadata. Very large valid schemas, event collections or outputs may reach these resource caps.
