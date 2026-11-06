@@ -259,13 +259,26 @@ impl ContractAbi {
     }
     /// Looks up a function, including functions declared in interfaces.
     pub fn function(&self, name: &str) -> Result<&AbiFunction, AbiError> {
-        self.function_indices
-            .get(name)
-            .and_then(|index| match &self.entries[*index] {
-                AbiEntry::Function(function) => Some(function),
-                _ => None,
-            })
-            .ok_or_else(|| error(format!("unknown function: {name}")))
+        self.function_with_schema_budget(name, &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+    }
+    fn function_with_schema_budget(
+        &self,
+        name: &str,
+        schema: &mut SchemaBudget,
+    ) -> Result<&AbiFunction, AbiError> {
+        schema.charge_text(name.len())?;
+        if let Some(function) =
+            self.function_indices
+                .get(name)
+                .and_then(|index| match &self.entries[*index] {
+                    AbiEntry::Function(function) => Some(function),
+                    _ => None,
+                })
+        {
+            return Ok(function);
+        }
+        schema.charge_owned(name.len().saturating_add("unknown function: ".len()))?;
+        Err(error(format!("unknown function: {name}")))
     }
     /// Validates and serializes positional arguments.
     pub fn encode_inputs(&self, name: &str, values: &[AbiValue]) -> Result<Vec<Felt>, AbiError> {
@@ -283,8 +296,9 @@ impl ContractAbi {
     ) -> Result<Vec<Felt>, AbiError> {
         schema.charge_text(name.len())?;
         schema.charge_owned(name.len())?;
-        let function = self.function(name)?;
+        let function = self.function_with_schema_budget(name, schema)?;
         if function.inputs.len() != values.len() {
+            schema.charge_owned(128)?;
             return Err(error(format!(
                 "wrong argument count for {name}: expected {}, got {}",
                 function.inputs.len(),
@@ -317,7 +331,7 @@ impl ContractAbi {
         let mut data = data;
         let mut budget = 1_000_000;
         let values = self
-            .function(name)?
+            .function_with_schema_budget(name, schema)?
             .outputs
             .iter()
             .map(|o| {
@@ -436,6 +450,9 @@ impl ContractAbi {
             budget.charge()?;
             return self.validate_type_graph("core::integer::u128", seen, depth + 1, budget);
         }
+        // Bool and Bytes are atomic public values: they have no named child
+        // values. Explicit ABI declaration fields were still validated above.
+        // u256 instead exposes named u128 low/high children in its public Struct.
         if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
             return Ok(());
         }
@@ -872,18 +889,32 @@ impl<P: starknet_rust_providers::Provider> Contract<P> {
         args: &[AbiValue],
         block: starknet_rust_core::types::BlockId,
     ) -> Result<Vec<AbiValue>, ContractCallError> {
+        self.call_with_schema_budget(
+            name,
+            args,
+            block,
+            &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK),
+        )
+        .await
+    }
+    async fn call_with_schema_budget(
+        &self,
+        name: &str,
+        args: &[AbiValue],
+        block: starknet_rust_core::types::BlockId,
+        schema: &mut SchemaBudget,
+    ) -> Result<Vec<AbiValue>, ContractCallError> {
         if !matches!(
             self.abi
-                .function(name)
+                .function_with_schema_budget(name, schema)
                 .map_err(ContractCallError::Abi)?
                 .state_mutability,
             starknet_rust_core::types::contract::StateMutability::View
         ) {
             return Err(ContractCallError::Abi(error("function is not marked view")));
         }
-        let mut schema = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
         let call = self
-            .populate_with_schema_budget(name, args, &mut schema)
+            .populate_with_schema_budget(name, args, schema)
             .map_err(ContractCallError::Abi)?;
         let result = self
             .provider
@@ -898,7 +929,7 @@ impl<P: starknet_rust_providers::Provider> Contract<P> {
             .await
             .map_err(ContractCallError::Provider)?;
         self.abi
-            .decode_outputs_with_schema_budget(name, &result, &mut schema)
+            .decode_outputs_with_schema_budget(name, &result, schema)
             .map_err(ContractCallError::Abi)
     }
 }
@@ -930,6 +961,122 @@ impl std::error::Error for ContractCallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opaque_byte_arrays_ignore_unreferenced_named_types_but_validate_explicit_fields() {
+        let mut bytes = vec![0xff; 31];
+        bytes.extend_from_slice(&[0x80, 0xff]);
+        let wire = [
+            Felt::ONE,
+            Felt::from_bytes_be_slice(&[0xff; 31]),
+            Felt::from(0x80ffu64),
+            Felt::from(2u64),
+        ];
+        for ty in [
+            "core::bytes_31::bytes31",
+            "core::integer::u32",
+            "core::felt252",
+        ] {
+            let malformed = serde_json::json!({"type":"struct","name":ty,"members":[{"name":"bad","type":"Unknown"}]});
+            let json = serde_json::json!([malformed.clone()]).to_string();
+            let codec = ContractAbi::from_json(&json).unwrap();
+            assert_eq!(
+                codec
+                    .encode_value(
+                        "core::byte_array::ByteArray",
+                        &AbiValue::Bytes(bytes.clone())
+                    )
+                    .unwrap(),
+                wire
+            );
+            assert_eq!(
+                codec
+                    .decode_value("core::byte_array::ByteArray", &mut wire.as_slice())
+                    .unwrap(),
+                AbiValue::Bytes(bytes.clone())
+            );
+            let json = serde_json::json!([malformed,{"type":"struct","name":"core::byte_array::ByteArray","members":[{"name":"declared","type":ty}]}]).to_string();
+            let codec = ContractAbi::from_json(&json).unwrap();
+            assert_eq!(
+                codec
+                    .decode_value("core::byte_array::ByteArray", &mut wire.as_slice())
+                    .unwrap_err()
+                    .to_string(),
+                "unsupported type: Unknown"
+            );
+            assert_eq!(
+                codec
+                    .encode_value(
+                        "core::byte_array::ByteArray",
+                        &AbiValue::Bytes(bytes.clone())
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "unsupported type: Unknown"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_function_diagnostics_are_charged_before_all_public_lookup_paths() {
+        let abi = ContractAbi::from_json("[]").unwrap();
+        let name = "missing".repeat(32);
+        for mode in 0..3 {
+            let mut resources = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+            resources.owned = 16;
+            let result = match mode {
+                0 => abi
+                    .function_with_schema_budget(&name, &mut resources)
+                    .map(|_| ()),
+                1 => abi
+                    .encode_inputs_with_schema_budget(&name, &[], &mut resources)
+                    .map(|_| ()),
+                _ => abi
+                    .decode_outputs_with_schema_budget(&name, &[], &mut resources)
+                    .map(|_| ()),
+            };
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "ABI logical allocation exceeds byte budget"
+            );
+            assert!(resources.exceeded);
+        }
+        let contract = Contract::new(
+            Felt::from(3u64),
+            abi,
+            starknet_rust_providers::JsonRpcClient::new(MockTransport),
+        );
+        let mut resources = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        resources.owned = 16;
+        assert_eq!(
+            contract
+                .call_with_schema_budget(
+                    &name,
+                    &[],
+                    starknet_rust_core::types::BlockId::Number(42),
+                    &mut resources
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert!(resources.exceeded);
+        assert_eq!(
+            contract.abi.function(&name).unwrap_err().to_string(),
+            format!("unknown function: {name}")
+        );
+        let known = "f".repeat(64);
+        let abi = ContractAbi::from_json(&serde_json::json!([{"type":"function","name":known,"inputs":[{"name":"x","type":"()"}],"outputs":[],"state_mutability":"view"}]).to_string()).unwrap();
+        let mut resources = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        resources.owned = known.len() + 1;
+        assert_eq!(
+            abi.encode_inputs_with_schema_budget(&known, &[], &mut resources)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+    }
+
     #[test]
     fn repeated_enum_encoding_charges_variant_name_search_work() {
         let names: Vec<_> = (0..4)

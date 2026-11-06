@@ -43,3 +43,12 @@ Completed schema-cache entries have a separate shared 64 MiB logical capacity; a
 skips optional insertions while valid decoding continues. Resource failures are not cached.
 Contract view calls share allowances across encoding and decoding. Very large valid cold schemas
 or outputs may reach these private resource caps.
+
+Builtin schema reachability follows the public logical value shape and explicit ABI declarations.
+`Bool` and `Bytes` (ByteArray) are atomic values; absent explicit metadata, unrelated malformed
+`bytes31`, `u32` or felt declarations are not dependencies of raw ByteArray words. Actual full-word
+and pending-word widths are checked directly. Any explicit ByteArray member referencing such a
+declaration is validated and rejected if malformed. By contrast, `u256` exposes named `u128`
+low/high children through its public struct value, so those named schemas are reachable.
+Function lookup diagnostics, including the initial view-call lookup and wrong-argument errors,
+are charged against the shared allowance before formatting their names.
