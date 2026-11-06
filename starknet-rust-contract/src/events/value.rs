@@ -122,11 +122,14 @@ impl EventTypes {
         if !seen.insert(ty.to_owned()) {
             return Ok(());
         }
-        if scalar_bits(ty).is_some()
-            || matches!(
-                ty,
-                "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
-            )
+        // Builtin wire encodings do not exempt an explicit ABI declaration from
+        // duplicate-name and nested-type validation.
+        if !self.type_indices.contains_key(ty)
+            && (scalar_bits(ty).is_some()
+                || matches!(
+                    ty,
+                    "core::bool" | "core::byte_array::ByteArray" | "core::integer::u256"
+                ))
         {
             return Ok(());
         }
@@ -463,6 +466,76 @@ mod tests {
                 .decode_value("BadEnum", &mut data.as_slice(), &mut 100)
                 .is_err()
         );
+    }
+    #[test]
+    fn declared_builtin_schemas_are_validated_before_consuming_values() {
+        for (ty, kind, fields, expected) in [
+            (
+                "core::integer::u256",
+                "struct",
+                serde_json::json!([{"name":"low","type":"core::integer::u128"},{"name":"low","type":"core::integer::u128"}]),
+                "duplicate ABI struct member",
+            ),
+            (
+                "core::bool",
+                "enum",
+                serde_json::json!([{"name":"False","type":"()"},{"name":"False","type":"()"}]),
+                "duplicate ABI enum variant",
+            ),
+            (
+                "core::felt252",
+                "struct",
+                serde_json::json!([{"name":"value","type":"Unknown"}]),
+                "unsupported type: Unknown",
+            ),
+            (
+                "core::byte_array::ByteArray",
+                "struct",
+                serde_json::json!([{"name":"data","type":"Unknown"}]),
+                "unsupported type: Unknown",
+            ),
+        ] {
+            let mut declaration = serde_json::json!({"type":kind,"name":ty});
+            declaration[if kind == "enum" {
+                "variants"
+            } else {
+                "members"
+            }] = fields;
+            let types =
+                EventTypes::new(serde_json::from_value(serde_json::json!([declaration])).unwrap());
+            for root in [ty.to_owned(), format!("core::array::Array::<{ty}>")] {
+                for _ in 0..2 {
+                    let input = [Felt::ZERO; 3];
+                    let mut data = input.as_slice();
+                    let mut budget = 100;
+                    assert_eq!(
+                        types
+                            .decode_value(&root, &mut data, &mut budget)
+                            .unwrap_err()
+                            .to_string(),
+                        expected
+                    );
+                    assert_eq!(data, input.as_slice());
+                    assert_eq!(budget, 100);
+                }
+            }
+        }
+    }
+    #[test]
+    fn valid_declared_builtins_keep_their_special_wire_encodings() {
+        let types = EventTypes::new(serde_json::from_str(r#"[{"type":"enum","name":"core::bool","variants":[{"name":"False","type":"()"},{"name":"True","type":"()"}]},{"type":"struct","name":"core::byte_array::ByteArray","members":[{"name":"data","type":"core::array::Array::<core::bytes_31::bytes31>"},{"name":"pending_word","type":"core::felt252"},{"name":"pending_word_len","type":"core::integer::u32"}]}]"#).unwrap());
+        for (ty, wire, value) in [
+            ("core::bool", vec![Felt::ONE], EventValue::Bool(true)),
+            (
+                "core::byte_array::ByteArray",
+                vec![Felt::ZERO, Felt::from(b'a'), Felt::ONE],
+                EventValue::Bytes(vec![b'a']),
+            ),
+        ] {
+            let mut data = wire.as_slice();
+            assert_eq!(types.decode_value(ty, &mut data, &mut 100).unwrap(), value);
+            assert_eq!(data, [] as [Felt; 0]);
+        }
     }
     #[test]
     fn aggregate_budget_bounds_nested_zero_sized_values() {
