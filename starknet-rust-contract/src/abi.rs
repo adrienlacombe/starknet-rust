@@ -286,6 +286,11 @@ impl ContractAbi {
             }
             _ => false,
         };
+        if let Some(inner) = ty.strip_prefix('@') {
+            // Snapshot ownership does not change the Cairo Serde wire form. Validate
+            // the referenced schema too, including any explicit declaration.
+            return self.validate_type_graph(inner, seen, depth + 1);
+        }
         if ty == "core::integer::u256" {
             // The builtin codec recursively uses this named limb type even when
             // the ABI omits a u256 declaration.
@@ -320,6 +325,9 @@ impl ContractAbi {
             return Err(error("ABI nesting exceeds 64"));
         }
         let ty = ty.trim();
+        if let Some(inner) = ty.strip_prefix('@') {
+            return self.encode(inner, value, out, depth + 1);
+        }
         if scalar_bits(ty).is_some() {
             if let AbiValue::Felt(f) = value {
                 validate_scalar(ty, *f)?;
@@ -429,6 +437,9 @@ impl ContractAbi {
             return Err(error("ABI nesting exceeds 64"));
         }
         let ty = ty.trim();
+        if let Some(inner) = ty.strip_prefix('@') {
+            return self.decode(inner, data, depth + 1, budget);
+        }
         if scalar_bits(ty).is_some() {
             let f = take(data)?;
             validate_scalar(ty, f)?;
@@ -453,10 +464,26 @@ impl ContractAbi {
         }
         if ty == "core::byte_array::ByteArray" {
             let n = length(take(data)?)?;
-            if n > data.len().saturating_sub(2) {
+            if data.len() < 2 || n > data.len() - 2 {
                 return Err(error("truncated ByteArray"));
             }
-            let mut bytes = Vec::new();
+            // Charge full words and the pending word before allocating their bytes.
+            let words = n
+                .checked_add(1)
+                .ok_or_else(|| error("ByteArray size overflow"))?;
+            *budget = budget
+                .checked_sub(words)
+                .ok_or_else(|| error("decoded values exceed one million nodes"))?;
+            let pending_len = length(data[n + 1])?;
+            let pending_word = data[n].to_bytes_be();
+            if pending_len > 30 || pending_word[..32 - pending_len].iter().any(|b| *b != 0) {
+                return Err(error("invalid ByteArray pending word"));
+            }
+            let capacity = n
+                .checked_mul(31)
+                .and_then(|size| size.checked_add(pending_len))
+                .ok_or_else(|| error("ByteArray size overflow"))?;
+            let mut bytes = Vec::with_capacity(capacity);
             for _ in 0..n {
                 let word = take(data)?.to_bytes_be();
                 if word[0] != 0 {
@@ -1393,6 +1420,107 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "unsupported type: Unknown"
+        );
+    }
+    #[test]
+    fn compiler_span_snapshots_preserve_array_wire_encoding() {
+        let artifact: serde_json::Value = serde_json::from_str(include_str!("../../starknet-rust-core/test-data/raw_gateway_responses/get_class_by_hash/3_cairo_1.txt")).unwrap();
+        let entries: Vec<AbiEntry> =
+            serde_json::from_str(artifact["abi"].as_str().unwrap()).unwrap();
+        let entries = entries.into_iter().filter(|entry| matches!(entry, AbiEntry::Struct(s) if s.name.starts_with("core::array::Span::<"))).collect();
+        let codec = ContractAbi::new(entries).unwrap();
+        let span = "core::array::Span::<core::felt252>";
+        let nested = "core::array::Span::<core::array::Span::<core::felt252>>";
+        for (ty, wire, value) in [
+            (span, vec![Felt::ZERO], AbiValue::Sequence(vec![])),
+            (
+                span,
+                vec![Felt::ONE, Felt::from(7_u64)],
+                AbiValue::Sequence(vec![AbiValue::Felt(Felt::from(7_u64))]),
+            ),
+            (nested, vec![Felt::ZERO], AbiValue::Sequence(vec![])),
+            (
+                nested,
+                vec![Felt::TWO, Felt::ONE, Felt::from(7_u64), Felt::ZERO],
+                AbiValue::Sequence(vec![
+                    AbiValue::Sequence(vec![AbiValue::Felt(Felt::from(7_u64))]),
+                    AbiValue::Sequence(vec![]),
+                ]),
+            ),
+            (
+                "core::array::Array::<core::array::Span::<core::felt252>>",
+                vec![Felt::ZERO],
+                AbiValue::Sequence(vec![]),
+            ),
+            (
+                "@core::array::Array::<core::felt252>",
+                vec![Felt::ONE, Felt::from(7_u64)],
+                AbiValue::Sequence(vec![AbiValue::Felt(Felt::from(7_u64))]),
+            ),
+        ] {
+            assert_eq!(codec.encode_value(ty, &value).unwrap(), wire);
+            let mut input = wire.as_slice();
+            assert_eq!(codec.decode_value(ty, &mut input).unwrap(), value);
+            assert_eq!(input, []);
+        }
+    }
+    #[test]
+    fn snapshots_validate_underlying_and_explicit_declarations() {
+        let codec = ContractAbi::new(vec![]).unwrap();
+        for ty in [
+            "@Unknown",
+            "core::array::Array::<@Unknown>",
+            "core::array::Span::<@Unknown>",
+        ] {
+            let mut input = [Felt::ZERO].as_slice();
+            assert_eq!(
+                codec.decode_value(ty, &mut input).unwrap_err().to_string(),
+                "unsupported type: Unknown"
+            );
+        }
+        for name in ["@core::felt252", "core::felt252"] {
+            let entries: Vec<AbiEntry> = serde_json::from_value(serde_json::json!([{"type":"struct","name":name,"members":[{"name":"bad","type":"Unknown"}]}])).unwrap();
+            let codec = ContractAbi::new(entries).unwrap();
+            let ty = "@core::felt252";
+            let mut input = [Felt::ZERO].as_slice();
+            assert_eq!(
+                codec.decode_value(ty, &mut input).unwrap_err().to_string(),
+                "unsupported type: Unknown"
+            );
+        }
+    }
+    #[test]
+    fn byte_array_words_share_budget_before_payload_allocation() {
+        let codec = ContractAbi::new(vec![]).unwrap();
+        let wire = [Felt::ONE, Felt::ZERO, Felt::ZERO, Felt::ZERO];
+        let mut input = wire.as_slice();
+        let mut budget = 3usize;
+        assert_eq!(
+            codec
+                .decode("core::byte_array::ByteArray", &mut input, 0, &mut budget)
+                .unwrap(),
+            AbiValue::Bytes(vec![0; 31])
+        );
+        assert_eq!(budget, 0);
+        let mut input = wire.as_slice();
+        let mut budget = 2usize;
+        assert!(
+            codec
+                .decode("core::byte_array::ByteArray", &mut input, 0, &mut budget)
+                .unwrap_err()
+                .to_string()
+                .contains("node")
+        );
+        assert_eq!(input.len(), 3); // Only the length prefix was consumed.
+
+        let mut input = [Felt::ZERO].as_slice();
+        let mut budget = 3usize;
+        assert_eq!(
+            codec
+                .decode("core::byte_array::ByteArray", &mut input, 0, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "truncated ByteArray"
         );
     }
 }
