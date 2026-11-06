@@ -26,3 +26,9 @@ finite values still obey the runtime depth and aggregate-node limits.
 
 Ambiguous duplicate names in ordinary struct members or enum variants are rejected before
 consuming their serialized values.
+
+Each public encode/decode operation also has a separate one-million-unit schema-work budget,
+shared across all roots, event candidates and matching events in `decode_from`. Graph visits and declaration edges consume this
+budget even for empty arrays; completed root validations are cached. Exceptionally complex cold
+schemas may hit this resource cap. Exhaustion is never cached as an invalid schema and event
+decoding stops on exhaustion even if an earlier candidate matched.

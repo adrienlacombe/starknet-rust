@@ -35,15 +35,40 @@ pub(super) fn error(message: impl Into<String>) -> EventDecodeError {
     EventDecodeError(message.into())
 }
 
+// Per operation, cold schema traversal is bounded independently of decoded value nodes.
+const DEFAULT_SCHEMA_WORK: usize = 1_000_000;
+pub(super) struct SchemaBudget {
+    pub(super) remaining: usize,
+    pub(super) exceeded: bool,
+}
+impl SchemaBudget {
+    const fn new(remaining: usize) -> Self {
+        Self {
+            remaining,
+            exceeded: false,
+        }
+    }
+    fn charge(&mut self) -> Result<(), EventDecodeError> {
+        if self.remaining == 0 {
+            self.exceeded = true;
+            return Err(error("ABI schema validation exceeds work budget"));
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
 pub(super) struct NodeBudget {
     pub(super) remaining: usize,
     pub(super) exceeded: bool,
+    pub(super) schema: SchemaBudget,
 }
 impl NodeBudget {
     pub(super) const fn new(remaining: usize) -> Self {
         Self {
             remaining,
             exceeded: false,
+            schema: SchemaBudget::new(DEFAULT_SCHEMA_WORK),
         }
     }
 }
@@ -102,13 +127,14 @@ impl EventTypes {
         data: &mut &[Felt],
         budget: &mut NodeBudget,
     ) -> Result<EventValue, EventDecodeError> {
-        self.validate_type(ty)?;
+        self.validate_type(ty, &mut budget.schema)?;
         self.decode(ty, data, 0, budget)
     }
     // Validate the schema independently of values, so empty arrays and unselected enum
     // variants cannot hide unsupported types. Each type is visited once, allowing recursive
     // named schemas without revisiting cycles; value depth/node limits still apply separately.
-    fn validate_type(&self, ty: &str) -> Result<(), EventDecodeError> {
+    fn validate_type(&self, ty: &str, budget: &mut SchemaBudget) -> Result<(), EventDecodeError> {
+        budget.charge()?;
         let ty = ty.trim();
         if let Some(result) = self
             .schema_results
@@ -121,11 +147,14 @@ impl EventTypes {
         #[cfg(test)]
         self.schema_passes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let result = self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0);
-        self.schema_results
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(ty.to_owned(), result.clone());
+        let result =
+            self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0, budget);
+        if !budget.exceeded {
+            self.schema_results
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(ty.to_owned(), result.clone());
+        }
         result
     }
     fn validate_type_graph(
@@ -133,7 +162,9 @@ impl EventTypes {
         ty: &str,
         seen: &mut std::collections::BTreeSet<String>,
         depth: usize,
+        budget: &mut SchemaBudget,
     ) -> Result<(), EventDecodeError> {
+        budget.charge()?;
         if depth > 64 {
             return Err(error("ABI type nesting exceeds 64"));
         }
@@ -148,20 +179,22 @@ impl EventTypes {
             Some(AbiEntry::Struct(definition)) => {
                 let mut names = std::collections::BTreeSet::new();
                 for member in &definition.members {
+                    budget.charge()?;
                     if !names.insert(&member.name) {
                         return Err(error("duplicate ABI struct member"));
                     }
-                    self.validate_type_graph(&member.r#type, seen, depth + 1)?;
+                    self.validate_type_graph(&member.r#type, seen, depth + 1, budget)?;
                 }
                 true
             }
             Some(AbiEntry::Enum(definition)) => {
                 let mut names = std::collections::BTreeSet::new();
                 for variant in &definition.variants {
+                    budget.charge()?;
                     if !names.insert(&variant.name) {
                         return Err(error("duplicate ABI enum variant"));
                     }
-                    self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
+                    self.validate_type_graph(&variant.r#type, seen, depth + 1, budget)?;
                 }
                 true
             }
@@ -170,22 +203,26 @@ impl EventTypes {
         if let Some(inner) = ty.strip_prefix('@') {
             // Snapshot ownership does not change the Cairo Serde wire form. Validate
             // the referenced schema too, including any explicit declaration.
-            return self.validate_type_graph(inner, seen, depth + 1);
+            budget.charge()?;
+            return self.validate_type_graph(inner, seen, depth + 1, budget);
         }
         if ty == "core::integer::u256" {
             // The builtin codec recursively uses this named limb type even when
             // the ABI omits a u256 declaration.
-            return self.validate_type_graph("core::integer::u128", seen, depth + 1);
+            budget.charge()?;
+            return self.validate_type_graph("core::integer::u128", seen, depth + 1, budget);
         }
         if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
             return Ok(());
         }
         if let Some(inner) = array_inner(ty) {
-            return self.validate_type_graph(inner, seen, depth + 1);
+            budget.charge()?;
+            return self.validate_type_graph(inner, seen, depth + 1, budget);
         }
         if let Some(types) = tuple_types(ty)? {
             for ty in types {
-                self.validate_type_graph(ty, seen, depth + 1)?;
+                budget.charge()?;
+                self.validate_type_graph(ty, seen, depth + 1, budget)?;
             }
             return Ok(());
         }

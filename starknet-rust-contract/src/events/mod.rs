@@ -228,7 +228,7 @@ impl EventDecoder {
                 let mut data = event.data.as_slice();
                 let fields = match self.fields(&route.ty, &mut keys, &mut data, 0, budget) {
                     Ok(fields) => fields,
-                    Err(error) if budget.exceeded => return Err(error),
+                    Err(error) if budget.exceeded || budget.schema.exceeded => return Err(error),
                     Err(error) => {
                         candidate_error.get_or_insert(error);
                         continue;
@@ -257,10 +257,24 @@ impl EventDecoder {
         events: &[Event],
         address: Felt,
     ) -> Result<Vec<DecodedEvent>, EventDecodeError> {
+        self.decode_from_with_budget(events, address, &mut NodeBudget::new(1_000_000))
+    }
+    fn decode_from_with_budget(
+        &self,
+        events: &[Event],
+        address: Felt,
+        budget: &mut NodeBudget,
+    ) -> Result<Vec<DecodedEvent>, EventDecodeError> {
         events
             .iter()
             .filter(|e| e.from_address == address)
-            .map(|e| self.decode(e))
+            .map(|e| {
+                // Value limits retain their per-event meaning; schema work belongs
+                // to the entire receipt operation, including cached root lookups.
+                budget.remaining = 1_000_000;
+                budget.exceeded = false;
+                self.decode_with_budget(e, budget)
+            })
             .collect()
     }
     fn fields(
@@ -559,6 +573,98 @@ mod tests {
             "Root",
         )
         .unwrap();
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "ambiguous event"
+        );
+    }
+    #[test]
+    fn receipt_schema_budget_is_shared_without_changing_per_event_value_limits() {
+        let abi = r#"[{"type":"event","name":"Payload","kind":"struct","members":[{"name":"value","type":"()","kind":"data"}]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Payload").unwrap();
+        let events = vec![
+            Event {
+                from_address: Felt::ONE,
+                keys: vec![],
+                data: vec![]
+            };
+            2
+        ];
+        let mut budget = NodeBudget::new(0);
+        budget.schema.remaining = 2; // First cold root succeeds; second cached lookup exceeds.
+        assert_eq!(
+            decoder
+                .decode_from_with_budget(&events, Felt::ONE, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI schema validation exceeds work budget"
+        );
+        assert!(budget.schema.exceeded);
+        assert!(!budget.exceeded);
+        assert_eq!(decoder.decode_from(&events, Felt::ONE).unwrap().len(), 2);
+        let mut budget = NodeBudget::new(0);
+        budget.schema.remaining = 2; // Both roots are now cached: one unit each.
+        assert_eq!(
+            decoder
+                .decode_from_with_budget(&events, Felt::ONE, &mut budget)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(budget.remaining, 999_998);
+        assert!(!budget.schema.exceeded);
+    }
+    #[test]
+    fn distinct_roots_share_schema_work_and_exhaustion_is_terminal() {
+        let members: Vec<_> = (0..32)
+            .map(|i| serde_json::json!({"name":format!("f{i}"),"type":"()"}))
+            .collect();
+        let mut entries =
+            vec![serde_json::json!({"type":"struct","name":"Large","members":members})];
+        for i in 0..4 {
+            entries.push(serde_json::json!({"type":"struct","name":format!("Wrapper{i}"),"members":[{"name":"shared","type":"Large"}]}));
+        }
+        let members: Vec<_> = (0..4).map(|i| serde_json::json!({"name":format!("arg{i}"),"type":format!("core::array::Array::<Wrapper{i}>"),"kind":"data"})).collect();
+        entries.push(
+            serde_json::json!({"type":"event","name":"Payload","kind":"struct","members":members}),
+        );
+        let decoder =
+            EventDecoder::from_json(&serde_json::to_string(&entries).unwrap(), "Payload").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![],
+            data: vec![Felt::ZERO; 4],
+        };
+        let mut budget = NodeBudget::new(100);
+        budget.schema.remaining = 100;
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI schema validation exceeds work budget"
+        );
+        assert_eq!(budget.schema.remaining, 0);
+        assert!(budget.schema.exceeded);
+        assert!(!budget.exceeded);
+        assert!(decoder.decode(&event).is_ok());
+        // An earlier successful flat candidate must not hide an uninspected later route.
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"key"}]},{"type":"event","name":"B","kind":"struct","members":[{"name":"value","type":"()","kind":"data"}]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap()],
+            data: vec![],
+        };
+        let mut budget = NodeBudget::new(4);
+        budget.schema.remaining = 2; // A completes; B cannot even start validation.
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI schema validation exceeds work budget"
+        );
         assert_eq!(
             decoder.decode(&event).unwrap_err().to_string(),
             "ambiguous event"
