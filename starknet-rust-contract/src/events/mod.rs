@@ -133,7 +133,10 @@ impl EventDecoder {
         let mut resources = SchemaBudget::new(1_000_000);
         resources.charge_text(root.len())?;
         resources.charge_owned(root.len())?;
-        let is_untyped = matches!(Self::event(&decoder.types, root)?, AbiEvent::Untyped(_));
+        let is_untyped = matches!(
+            Self::event(&decoder.types, root, &mut resources)?,
+            AbiEvent::Untyped(_)
+        );
         Self::collect_routes(
             &decoder.types,
             &mut decoder.routes,
@@ -167,15 +170,25 @@ impl EventDecoder {
             root,
         )
     }
-    fn event<'a>(types: &'a EventTypes, name: &str) -> Result<&'a AbiEvent, EventDecodeError> {
-        types
-            .event_indices
-            .get(name)
-            .and_then(|index| match &types.entries[*index] {
-                AbiEntry::Event(event) => Some(event),
-                _ => None,
-            })
-            .ok_or_else(|| error(format!("unknown event type: {name}")))
+    fn event<'a>(
+        types: &'a EventTypes,
+        name: &str,
+        resources: &mut SchemaBudget,
+    ) -> Result<&'a AbiEvent, EventDecodeError> {
+        resources.charge_text(name.len())?;
+        if let Some(event) =
+            types
+                .event_indices
+                .get(name)
+                .and_then(|index| match &types.entries[*index] {
+                    AbiEntry::Event(event) => Some(event),
+                    _ => None,
+                })
+        {
+            return Ok(event);
+        }
+        resources.charge_owned(name.len().saturating_add("unknown event type: ".len()))?;
+        Err(error(format!("unknown event type: {name}")))
     }
     fn collect_routes(
         types: &EventTypes,
@@ -203,7 +216,9 @@ impl EventDecoder {
         stack.push(ty.into());
         // ABI definitions stay in one immutable store. Only route metadata is
         // copied; a large leaf shared by many aliases is never cloned per visit.
-        if let AbiEvent::Typed(TypedAbiEvent::Enum(e)) = Self::event(types, ty)? {
+        if let AbiEvent::Typed(TypedAbiEvent::Enum(e)) =
+            Self::event(types, ty, &mut budget.resources)?
+        {
             for v in &e.variants {
                 budget.resources.charge_text(v.name.len())?;
                 budget.resources.charge_owned(
@@ -248,6 +263,11 @@ impl EventDecoder {
         let mut matched = None;
         let mut candidate_error = None;
         for route in &self.routes {
+            // Charge misses as well as matches before comparing selector prefixes.
+            // This allowance survives per-event node resets in decode_from.
+            budget
+                .schema
+                .charge_routes(1 + event.keys.len().min(route.selectors.len()))?;
             if event.keys.starts_with(&route.selectors) {
                 let mut keys = &event.keys[route.selectors.len()..];
                 let mut data = event.data.as_slice();
@@ -330,7 +350,7 @@ impl EventDecoder {
             return Err(error("event nesting exceeds 64"));
         }
         let mut fields = BTreeMap::new();
-        match Self::event(&self.types, ty)? {
+        match Self::event(&self.types, ty, &mut budget.schema)? {
             AbiEvent::Untyped(e) => {
                 for m in &e.inputs {
                     budget.schema.charge_text(m.name.len())?;
@@ -396,6 +416,97 @@ fn event_name(e: &AbiEvent) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_route_work_counts_misses_and_is_terminal_after_a_prior_match() {
+        let variants: Vec<_> = (0..8).map(|index| serde_json::json!({"name":format!("R{index}"),"type":"Empty","kind":"nested"})).collect();
+        let abi = serde_json::json!([{"type":"event","name":"Root","kind":"enum","variants":variants},{"type":"event","name":"Empty","kind":"struct","members":[]}]).to_string();
+        let decoder = EventDecoder::from_json(&abi, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("R7").unwrap()],
+            data: vec![],
+        };
+        let mut budget = NodeBudget::new(100);
+        budget.schema.route_remaining = 20;
+        assert_eq!(
+            decoder
+                .decode_from_with_budget(&[event.clone(), event], Felt::ONE, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "event route inspection exceeds work budget"
+        );
+        assert!(budget.schema.exceeded);
+        assert_eq!(budget.schema.route_remaining, 0);
+        let abi = r#"[{"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},{"type":"event","name":"A","kind":"struct","members":[{"name":"value","type":"core::felt252","kind":"key"}]},{"type":"event","name":"B","kind":"struct","members":[]}]"#;
+        let decoder = EventDecoder::from_json(abi, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap()],
+            data: vec![],
+        };
+        assert_eq!(
+            decoder.decode(&event).unwrap_err().to_string(),
+            "ambiguous event"
+        );
+        let mut budget = NodeBudget::new(100);
+        budget.schema.route_remaining = 2;
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "event route inspection exceeds work budget"
+        );
+        assert!(budget.schema.exceeded);
+    }
+    #[test]
+    fn missing_nested_event_diagnostic_is_charged_after_an_earlier_match() {
+        let missing = "Missing".repeat(32);
+        let abi = serde_json::json!([
+            {"type":"event","name":"Root","kind":"enum","variants":[{"name":"A","type":"A","kind":"flat"},{"name":"B","type":"B","kind":"nested"}]},
+            {"type":"event","name":"A","kind":"struct","members":[{"name":"selector","type":"core::felt252","kind":"key"}]},
+            {"type":"event","name":"B","kind":"struct","members":[{"name":"missing","type":missing,"kind":"nested"}]}
+        ]).to_string();
+        let decoder = EventDecoder::from_json(&abi, "Root").unwrap();
+        let event = Event {
+            from_address: Felt::ONE,
+            keys: vec![selector("B").unwrap()],
+            data: vec![],
+        };
+        assert_eq!(decoder.decode(&event).unwrap().path, vec!["A"]);
+        let a_decoder = EventDecoder::from_json(&abi, "A").unwrap();
+        let mut consumed = 0;
+        for _ in 0..2 {
+            let mut budget = NodeBudget::new(100);
+            a_decoder.decode_with_budget(&event, &mut budget).unwrap();
+            consumed = 64 * 1024 * 1024 - budget.schema.owned;
+        }
+        let diagnostic = missing.len() + "unknown event type: ".len();
+        let before_diagnostic = 4 * std::mem::size_of::<BTreeMap<String, EventValue>>()
+            + "missing".len()
+            + 2 * std::mem::size_of::<String>()
+            + "A".len();
+        let mut budget = NodeBudget::new(100);
+        budget.schema.owned = consumed + before_diagnostic + diagnostic / 2;
+        assert_eq!(
+            decoder
+                .decode_with_budget(&event, &mut budget)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+        assert_eq!(budget.schema.owned, diagnostic / 2);
+        assert!(budget.schema.exceeded);
+        let mut resources = SchemaBudget::new(1_000_000);
+        resources.owned = 16;
+        assert_eq!(
+            EventDecoder::event(&decoder.types, &missing, &mut resources)
+                .unwrap_err()
+                .to_string(),
+            "ABI logical allocation exceeds byte budget"
+        );
+    }
+
     #[test]
     fn logical_byte_limits_cover_event_metadata_and_aggregate_empty_receipts() {
         let name = "e".repeat(256);
@@ -625,11 +736,17 @@ mod tests {
         let decoder = EventDecoder::from_json(&abi.to_string(), "Root").unwrap();
         assert_eq!(decoder.routes.len(), 128);
         assert_eq!(decoder.types.entries.len(), 2);
-        let leaf = EventDecoder::event(&decoder.types, "LargeLeaf").unwrap();
+        let leaf = EventDecoder::event(
+            &decoder.types,
+            "LargeLeaf",
+            &mut SchemaBudget::new(1_000_000),
+        )
+        .unwrap();
         for route in &decoder.routes {
             assert!(std::ptr::eq(
                 leaf,
-                EventDecoder::event(&decoder.types, &route.ty).unwrap()
+                EventDecoder::event(&decoder.types, &route.ty, &mut SchemaBudget::new(1_000_000))
+                    .unwrap()
             ));
         }
         for index in [0, 64, 127] {

@@ -87,6 +87,7 @@ pub(super) struct SchemaBudget {
     pub(super) exceeded: bool,
     pub(super) owned: usize,
     pub(super) text: usize,
+    pub(super) route_remaining: usize,
 }
 impl SchemaBudget {
     pub(super) const fn new(remaining: usize) -> Self {
@@ -95,6 +96,7 @@ impl SchemaBudget {
             exceeded: false,
             owned: 64 * 1024 * 1024,
             text: 64 * 1024 * 1024,
+            route_remaining: 1_000_000,
         }
     }
     fn charge(&mut self) -> Result<(), EventDecodeError> {
@@ -106,6 +108,14 @@ impl SchemaBudget {
         Ok(())
     }
 
+    pub(super) fn charge_routes(&mut self, count: usize) -> Result<(), EventDecodeError> {
+        let Some(remaining) = self.route_remaining.checked_sub(count) else {
+            self.exceeded = true;
+            return Err(error("event route inspection exceeds work budget"));
+        };
+        self.route_remaining = remaining;
+        Ok(())
+    }
     pub(super) fn charge_owned(&mut self, count: usize) -> Result<(), EventDecodeError> {
         let Some(remaining) = self.owned.checked_sub(count) else {
             self.exceeded = true;
@@ -291,6 +301,9 @@ impl EventTypes {
             budget.charge()?;
             return self.validate_type_graph("core::integer::u128", seen, depth + 1, budget);
         }
+        // Bool and Bytes are atomic public values: they have no named child
+        // values. Explicit ABI declaration fields were still validated above.
+        // u256 instead exposes named u128 low/high children in its public Struct.
         if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
             return Ok(());
         }
@@ -549,6 +562,51 @@ fn length(value: Felt) -> Result<usize, EventDecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opaque_byte_arrays_ignore_unreferenced_named_types_but_validate_explicit_fields() {
+        let mut bytes = vec![0xff; 31];
+        bytes.extend_from_slice(&[0x80, 0xff]);
+        let wire = [
+            Felt::ONE,
+            Felt::from_bytes_be_slice(&[0xff; 31]),
+            Felt::from(0x80ffu64),
+            Felt::from(2u64),
+        ];
+        for ty in [
+            "core::bytes_31::bytes31",
+            "core::integer::u32",
+            "core::felt252",
+        ] {
+            let malformed = serde_json::json!({"type":"struct","name":ty,"members":[{"name":"bad","type":"Unknown"}]});
+            let json = serde_json::json!([malformed.clone()]).to_string();
+            let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
+
+            assert_eq!(
+                codec
+                    .decode_value(
+                        "core::byte_array::ByteArray",
+                        &mut wire.as_slice(),
+                        &mut NodeBudget::new(100)
+                    )
+                    .unwrap(),
+                EventValue::Bytes(bytes.clone())
+            );
+            let json = serde_json::json!([malformed,{"type":"struct","name":"core::byte_array::ByteArray","members":[{"name":"declared","type":ty}]}]).to_string();
+            let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
+            assert_eq!(
+                codec
+                    .decode_value(
+                        "core::byte_array::ByteArray",
+                        &mut wire.as_slice(),
+                        &mut NodeBudget::new(100)
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "unsupported type: Unknown"
+            );
+        }
+    }
+
     #[test]
     fn text_exhaustion_and_cached_diagnostic_copy_cannot_poison_structural_results() {
         let unknown = "Unknown".repeat(64);
