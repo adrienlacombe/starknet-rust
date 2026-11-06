@@ -59,7 +59,7 @@ impl EventDecoder {
         }
         let mut flat = vec![];
         flatten(entries, &mut flat);
-        let types = EventTypes { entries: flat };
+        let types = EventTypes::new(flat);
         let mut event_names = BTreeSet::new();
         let mut type_names = BTreeSet::new();
         for entry in &types.entries {
@@ -108,10 +108,10 @@ impl EventDecoder {
     }
     fn event(&self, name: &str) -> Result<&AbiEvent, EventDecodeError> {
         self.types
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                AbiEntry::Event(e) if event_name(e) == name => Some(e),
+            .event_indices
+            .get(name)
+            .and_then(|index| match &self.types.entries[*index] {
+                AbiEntry::Event(event) => Some(event),
                 _ => None,
             })
             .ok_or_else(|| error(format!("unknown event type: {name}")))

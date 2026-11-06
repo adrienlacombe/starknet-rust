@@ -1,5 +1,5 @@
 use starknet_rust_core::types::{Felt, contract::AbiEntry};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::RwLock};
 /// A value described by a Cairo 1 ABI. Integers use canonical field encodings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventValue {
@@ -44,8 +44,39 @@ pub(super) fn charge_node(budget: &mut usize) -> Result<(), EventDecodeError> {
 
 pub(super) struct EventTypes {
     pub(super) entries: Vec<AbiEntry>,
+    type_indices: BTreeMap<String, usize>,
+    pub(super) event_indices: BTreeMap<String, usize>,
+    #[cfg(test)]
+    schema_passes: std::sync::atomic::AtomicUsize,
+    schema_results: RwLock<BTreeMap<String, Result<(), EventDecodeError>>>,
 }
 impl EventTypes {
+    pub(super) fn new(entries: Vec<AbiEntry>) -> Self {
+        let mut type_indices = BTreeMap::new();
+        let mut event_indices = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            match entry {
+                AbiEntry::Struct(s) => {
+                    type_indices.insert(s.name.clone(), index);
+                }
+                AbiEntry::Enum(e) => {
+                    type_indices.insert(e.name.clone(), index);
+                }
+                AbiEntry::Event(e) => {
+                    event_indices.insert(super::event_name(e).to_owned(), index);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            entries,
+            type_indices,
+            event_indices,
+            #[cfg(test)]
+            schema_passes: std::sync::atomic::AtomicUsize::new(0),
+            schema_results: RwLock::new(BTreeMap::new()),
+        }
+    }
     pub(super) fn decode_value(
         &self,
         ty: &str,
@@ -59,7 +90,24 @@ impl EventTypes {
     // variants cannot hide unsupported types. Each type is visited once, allowing recursive
     // named schemas without revisiting cycles; value depth/node limits still apply separately.
     fn validate_type(&self, ty: &str) -> Result<(), EventDecodeError> {
-        self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0)
+        let ty = ty.trim();
+        if let Some(result) = self
+            .schema_results
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(ty)
+        {
+            return result.clone();
+        }
+        #[cfg(test)]
+        self.schema_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0);
+        self.schema_results
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(ty.to_owned(), result.clone());
+        result
     }
     fn validate_type_graph(
         &self,
@@ -91,7 +139,7 @@ impl EventTypes {
             }
             return Ok(());
         }
-        for entry in &self.entries {
+        if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
             match entry {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut names = std::collections::BTreeSet::new();
@@ -191,7 +239,7 @@ impl EventTypes {
                 .collect::<Result<Vec<_>, _>>()
                 .map(EventValue::Sequence);
         }
-        for entry in &self.entries {
+        if let Some(entry) = self.type_indices.get(ty).map(|index| &self.entries[*index]) {
             match entry {
                 AbiEntry::Struct(s) if s.name == ty => {
                     let mut values = BTreeMap::new();
@@ -303,9 +351,66 @@ fn length(value: Felt) -> Result<usize, EventDecodeError> {
 mod tests {
     use super::*;
     #[test]
+    fn cached_recursive_schema_errors_propagate_and_decoder_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::super::EventDecoder>();
+        let types = EventTypes::new(serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"invalid","type":"Unknown"}]}]"#).unwrap());
+        for _ in 0..2 {
+            for ty in ["core::array::Array::<Node>", "Node"] {
+                assert!(
+                    types
+                        .decode_value(ty, &mut [Felt::ZERO].as_slice(), &mut 1_000_000)
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(
+            types
+                .schema_passes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+    #[test]
+    fn repeated_empty_arrays_validate_the_large_schema_only_once() {
+        let mut entries = vec![];
+        for index in 0..1_000 {
+            entries.push(serde_json::json!({"type":"struct","name":format!("Unrelated{index}"),"members":[]}));
+        }
+        let members: Vec<_> = (0..4_096)
+            .map(|index| serde_json::json!({"name":format!("field{index}"),"type":"core::felt252"}))
+            .collect();
+        entries.push(serde_json::json!({"type":"struct","name":"Large","members":members}));
+        let types =
+            EventTypes::new(serde_json::from_value(serde_json::Value::Array(entries)).unwrap());
+        for _ in 0..256 {
+            assert_eq!(
+                types
+                    .decode_value(
+                        "core::array::Array::<Large>",
+                        &mut [Felt::ZERO].as_slice(),
+                        &mut 1_000_000
+                    )
+                    .unwrap(),
+                EventValue::Sequence(vec![])
+            );
+            assert!(
+                types
+                    .decode_value("Unknown", &mut [].as_slice(), &mut 1_000_000)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            types
+                .schema_passes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+    #[test]
     fn empty_array_schema_validation_handles_cycles_and_all_siblings() {
         let entries = serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"Unknown"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"Unknown"}]}]"#).unwrap();
-        let types = EventTypes { entries };
+        let types = EventTypes::new(entries);
         for ty in [
             "core::array::Array::<Unknown>",
             "core::array::Span::<Unknown>",
@@ -321,7 +426,7 @@ mod tests {
                 "{ty}"
             );
         }
-        let types = EventTypes { entries: serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"core::felt252"}]}]"#).unwrap() };
+        let types = EventTypes::new(serde_json::from_str(r#"[{"type":"struct","name":"Node","members":[{"name":"children","type":"core::array::Array::<Node>"},{"name":"value","type":"core::felt252"}]}]"#).unwrap());
         assert_eq!(
             types
                 .decode_value(
@@ -348,7 +453,7 @@ mod tests {
     }
     #[test]
     fn duplicate_ordinary_struct_fields_are_rejected_before_consuming_values() {
-        let types = EventTypes { entries: serde_json::from_str(r#"[{"type":"struct","name":"Bad","members":[{"name":"x","type":"core::integer::u8"},{"name":"x","type":"core::integer::u8"}]},{"type":"enum","name":"BadEnum","variants":[{"name":"A","type":"core::integer::u8"},{"name":"A","type":"core::integer::u8"}]}]"#).unwrap() };
+        let types = EventTypes::new(serde_json::from_str(r#"[{"type":"struct","name":"Bad","members":[{"name":"x","type":"core::integer::u8"},{"name":"x","type":"core::integer::u8"}]},{"type":"enum","name":"BadEnum","variants":[{"name":"A","type":"core::integer::u8"},{"name":"A","type":"core::integer::u8"}]}]"#).unwrap());
         let data = [Felt::ONE, Felt::TWO];
         let mut input = data.as_slice();
         assert!(types.decode_value("Bad", &mut input, &mut 100).is_err());
@@ -361,7 +466,7 @@ mod tests {
     }
     #[test]
     fn aggregate_budget_bounds_nested_zero_sized_values() {
-        let types = EventTypes { entries: vec![] };
+        let types = EventTypes::new(vec![]);
         let data = [Felt::TWO, Felt::from(6u8), Felt::from(6u8)];
         assert!(
             types
