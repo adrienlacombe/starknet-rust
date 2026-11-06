@@ -26,3 +26,8 @@ fields/variants; runtime value depth and aggregate-node limits still apply.
 
 Duplicate ordinary struct-member or enum-variant names are rejected during schema validation,
 preventing lossy or ambiguous decoded values.
+
+Each public encode/decode operation also has a separate one-million-unit schema-work budget,
+shared across all argument or output roots, including both phases of a contract view call. Graph visits and declaration edges consume this
+budget even for empty arrays; completed root validations are cached. Exceptionally complex cold
+schemas may hit this resource cap. Exhaustion is never cached as an invalid schema; a later call starts with a fresh budget.

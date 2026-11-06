@@ -47,6 +47,29 @@ fn error(message: impl Into<String>) -> AbiError {
     AbiError(message.into())
 }
 
+// Per operation, cold schema traversal is bounded independently of decoded value nodes.
+const DEFAULT_SCHEMA_WORK: usize = 1_000_000;
+struct SchemaBudget {
+    remaining: usize,
+    exceeded: bool,
+}
+impl SchemaBudget {
+    const fn new(remaining: usize) -> Self {
+        Self {
+            remaining,
+            exceeded: false,
+        }
+    }
+    fn charge(&mut self) -> Result<(), AbiError> {
+        if self.remaining == 0 {
+            self.exceeded = true;
+            return Err(error("ABI schema validation exceeds work budget"));
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
 /// A runtime Cairo 1 ABI. Unsupported types fail explicitly rather than being treated as felts.
 #[derive(Debug, Clone)]
 pub struct ContractAbi {
@@ -180,6 +203,18 @@ impl ContractAbi {
     }
     /// Validates and serializes positional arguments.
     pub fn encode_inputs(&self, name: &str, values: &[AbiValue]) -> Result<Vec<Felt>, AbiError> {
+        self.encode_inputs_with_schema_budget(
+            name,
+            values,
+            &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK),
+        )
+    }
+    fn encode_inputs_with_schema_budget(
+        &self,
+        name: &str,
+        values: &[AbiValue],
+        schema: &mut SchemaBudget,
+    ) -> Result<Vec<Felt>, AbiError> {
         let function = self.function(name)?;
         if function.inputs.len() != values.len() {
             return Err(error(format!(
@@ -190,13 +225,25 @@ impl ContractAbi {
         }
         let mut output = vec![];
         for (field, value) in function.inputs.iter().zip(values) {
-            self.validate_type(&field.r#type)?;
+            self.validate_type(&field.r#type, schema)?;
             self.encode(&field.r#type, value, &mut output, 0)?;
         }
         Ok(output)
     }
     /// Decodes all outputs, rejecting truncated and trailing return data.
     pub fn decode_outputs(&self, name: &str, data: &[Felt]) -> Result<Vec<AbiValue>, AbiError> {
+        self.decode_outputs_with_schema_budget(
+            name,
+            data,
+            &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK),
+        )
+    }
+    fn decode_outputs_with_schema_budget(
+        &self,
+        name: &str,
+        data: &[Felt],
+        schema: &mut SchemaBudget,
+    ) -> Result<Vec<AbiValue>, AbiError> {
         let mut data = data;
         let mut budget = 1_000_000;
         let values = self
@@ -204,7 +251,7 @@ impl ContractAbi {
             .outputs
             .iter()
             .map(|o| {
-                self.validate_type(&o.r#type)?;
+                self.validate_type(&o.r#type, schema)?;
                 self.decode(&o.r#type, &mut data, 0, &mut budget)
             })
             .collect::<Result<_, _>>()?;
@@ -215,20 +262,21 @@ impl ContractAbi {
     }
     /// Serializes a standalone ABI type.
     pub fn encode_value(&self, ty: &str, value: &AbiValue) -> Result<Vec<Felt>, AbiError> {
-        self.validate_type(ty)?;
+        self.validate_type(ty, &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))?;
         let mut out = vec![];
         self.encode(ty, value, &mut out, 0)?;
         Ok(out)
     }
     /// Decodes a standalone ABI type, consuming only the required prefix.
     pub fn decode_value(&self, ty: &str, data: &mut &[Felt]) -> Result<AbiValue, AbiError> {
-        self.validate_type(ty)?;
+        self.validate_type(ty, &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))?;
         self.decode(ty, data, 0, &mut 1_000_000)
     }
     // Validate the schema independently of values, so empty arrays and unselected enum
     // variants cannot hide unsupported types. Each type is visited once, allowing recursive
     // named schemas without revisiting cycles; value depth/node limits still apply separately.
-    fn validate_type(&self, ty: &str) -> Result<(), AbiError> {
+    fn validate_type(&self, ty: &str, budget: &mut SchemaBudget) -> Result<(), AbiError> {
+        budget.charge()?;
         let ty = ty.trim();
         if let Some(result) = self
             .schema_results
@@ -238,8 +286,9 @@ impl ContractAbi {
         {
             return result.clone();
         }
-        let result = self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0);
-        if self.cacheable_types.contains(ty) {
+        let result =
+            self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0, budget);
+        if !budget.exceeded && self.cacheable_types.contains(ty) {
             self.schema_results
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -252,7 +301,9 @@ impl ContractAbi {
         ty: &str,
         seen: &mut std::collections::BTreeSet<String>,
         depth: usize,
+        budget: &mut SchemaBudget,
     ) -> Result<(), AbiError> {
+        budget.charge()?;
         if depth > 64 {
             return Err(error("ABI type nesting exceeds 64"));
         }
@@ -267,20 +318,22 @@ impl ContractAbi {
             Some(AbiEntry::Struct(definition)) => {
                 let mut names = std::collections::BTreeSet::new();
                 for member in &definition.members {
+                    budget.charge()?;
                     if !names.insert(&member.name) {
                         return Err(error("duplicate ABI struct member"));
                     }
-                    self.validate_type_graph(&member.r#type, seen, depth + 1)?;
+                    self.validate_type_graph(&member.r#type, seen, depth + 1, budget)?;
                 }
                 true
             }
             Some(AbiEntry::Enum(definition)) => {
                 let mut names = std::collections::BTreeSet::new();
                 for variant in &definition.variants {
+                    budget.charge()?;
                     if !names.insert(&variant.name) {
                         return Err(error("duplicate ABI enum variant"));
                     }
-                    self.validate_type_graph(&variant.r#type, seen, depth + 1)?;
+                    self.validate_type_graph(&variant.r#type, seen, depth + 1, budget)?;
                 }
                 true
             }
@@ -289,22 +342,26 @@ impl ContractAbi {
         if let Some(inner) = ty.strip_prefix('@') {
             // Snapshot ownership does not change the Cairo Serde wire form. Validate
             // the referenced schema too, including any explicit declaration.
-            return self.validate_type_graph(inner, seen, depth + 1);
+            budget.charge()?;
+            return self.validate_type_graph(inner, seen, depth + 1, budget);
         }
         if ty == "core::integer::u256" {
             // The builtin codec recursively uses this named limb type even when
             // the ABI omits a u256 declaration.
-            return self.validate_type_graph("core::integer::u128", seen, depth + 1);
+            budget.charge()?;
+            return self.validate_type_graph("core::integer::u128", seen, depth + 1, budget);
         }
         if scalar_bits(ty).is_some() || matches!(ty, "core::bool" | "core::byte_array::ByteArray") {
             return Ok(());
         }
         if let Some(inner) = array_inner(ty) {
-            return self.validate_type_graph(inner, seen, depth + 1);
+            budget.charge()?;
+            return self.validate_type_graph(inner, seen, depth + 1, budget);
         }
         if let Some(types) = tuple_types(ty)? {
             for ty in types {
-                self.validate_type_graph(ty, seen, depth + 1)?;
+                budget.charge()?;
+                self.validate_type_graph(ty, seen, depth + 1, budget)?;
             }
             return Ok(());
         }
@@ -650,7 +707,17 @@ impl<P> Contract<P> {
         name: &str,
         args: &[AbiValue],
     ) -> Result<starknet_rust_core::types::Call, AbiError> {
-        let calldata = self.abi.encode_inputs(name, args)?;
+        self.populate_with_schema_budget(name, args, &mut SchemaBudget::new(DEFAULT_SCHEMA_WORK))
+    }
+    fn populate_with_schema_budget(
+        &self,
+        name: &str,
+        args: &[AbiValue],
+        schema: &mut SchemaBudget,
+    ) -> Result<starknet_rust_core::types::Call, AbiError> {
+        let calldata = self
+            .abi
+            .encode_inputs_with_schema_budget(name, args, schema)?;
         Ok(starknet_rust_core::types::Call {
             to: self.address,
             selector: get_selector_from_name(name).map_err(|e| error(e.to_string()))?,
@@ -684,7 +751,10 @@ impl<P: starknet_rust_providers::Provider> Contract<P> {
         ) {
             return Err(ContractCallError::Abi(error("function is not marked view")));
         }
-        let call = self.populate(name, args).map_err(ContractCallError::Abi)?;
+        let mut schema = SchemaBudget::new(DEFAULT_SCHEMA_WORK);
+        let call = self
+            .populate_with_schema_budget(name, args, &mut schema)
+            .map_err(ContractCallError::Abi)?;
         let result = self
             .provider
             .call(
@@ -698,7 +768,7 @@ impl<P: starknet_rust_providers::Provider> Contract<P> {
             .await
             .map_err(ContractCallError::Provider)?;
         self.abi
-            .decode_outputs(name, &result)
+            .decode_outputs_with_schema_budget(name, &result, &mut schema)
             .map_err(ContractCallError::Abi)
     }
 }
@@ -730,6 +800,53 @@ impl std::error::Error for ContractCallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn distinct_roots_share_schema_work_and_exhaustion_does_not_poison_cache() {
+        let members: Vec<_> = (0..32)
+            .map(|i| serde_json::json!({"name":format!("f{i}"),"type":"()"}))
+            .collect();
+        let mut entries =
+            vec![serde_json::json!({"type":"struct","name":"Large","members":members})];
+        for i in 0..4 {
+            entries.push(serde_json::json!({"type":"struct","name":format!("Wrapper{i}"),"members":[{"name":"shared","type":"Large"}]}));
+        }
+        let inputs: Vec<_> = (0..4).map(|i| serde_json::json!({"name":format!("arg{i}"),"type":format!("core::array::Array::<Wrapper{i}>")})).collect();
+        let outputs: Vec<_> = inputs
+            .iter()
+            .map(|v| serde_json::json!({"type":v["type"]}))
+            .collect();
+        entries.push(serde_json::json!({"type":"function","name":"f","inputs":inputs,"outputs":outputs,"state_mutability":"view"}));
+        let json = serde_json::to_string(&entries).unwrap();
+        let values = vec![AbiValue::Sequence(vec![]); 4];
+        // Each root needs over 64 visits/edges, despite encoding a single zero felt.
+        // A per-root budget would incorrectly let all four roots through.
+        for encode in [true, false] {
+            let abi = ContractAbi::from_json(&json).unwrap();
+            let mut budget = SchemaBudget::new(100);
+            let result = if encode {
+                abi.encode_inputs_with_schema_budget("f", &values, &mut budget)
+                    .map(|_| ())
+            } else {
+                abi.decode_outputs_with_schema_budget("f", &[Felt::ZERO; 4], &mut budget)
+                    .map(|_| ())
+            };
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "ABI schema validation exceeds work budget"
+            );
+            assert_eq!(budget.remaining, 0);
+            assert!(budget.exceeded);
+            let cache = abi.schema_results.read().unwrap();
+            assert_eq!(cache.len(), 1);
+            assert!(cache.values().all(Result::is_ok));
+            drop(cache);
+            assert_eq!(
+                abi.encode_inputs("f", &values).unwrap(),
+                vec![Felt::ZERO; 4]
+            );
+            assert_eq!(abi.decode_outputs("f", &[Felt::ZERO; 4]).unwrap(), values);
+        }
+    }
     fn nested_interfaces(mut entry: AbiEntry, depth: usize) -> AbiEntry {
         for _ in 0..depth {
             entry = AbiEntry::Interface(starknet_rust_core::types::contract::AbiInterface {
