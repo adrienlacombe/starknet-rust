@@ -7,7 +7,7 @@ use starknet_rust_core::{
     utils::get_selector_from_name,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{Arc, RwLock},
 };
@@ -53,6 +53,7 @@ pub struct ContractAbi {
     entries: Vec<AbiEntry>,
     type_indices: BTreeMap<String, usize>,
     function_indices: BTreeMap<String, usize>,
+    cacheable_types: BTreeSet<String>,
     schema_results: Arc<RwLock<BTreeMap<String, Result<(), AbiError>>>>,
 }
 impl ContractAbi {
@@ -90,10 +91,51 @@ impl ContractAbi {
                 indices.insert(name.clone(), index);
             }
         }
+        // Only finite ABI-owned root names may occupy the cache. Public standalone
+        // encode/decode callers can supply arbitrary type strings, including invalid names.
+        let mut cacheable_types = BTreeSet::new();
+        for entry in &flattened {
+            match entry {
+                AbiEntry::Function(function) => {
+                    cacheable_types.extend(
+                        function
+                            .inputs
+                            .iter()
+                            .map(|member| member.r#type.trim().to_owned()),
+                    );
+                    cacheable_types.extend(
+                        function
+                            .outputs
+                            .iter()
+                            .map(|member| member.r#type.trim().to_owned()),
+                    );
+                }
+                AbiEntry::Struct(definition) => {
+                    cacheable_types.insert(definition.name.clone());
+                    cacheable_types.extend(
+                        definition
+                            .members
+                            .iter()
+                            .map(|member| member.r#type.trim().to_owned()),
+                    );
+                }
+                AbiEntry::Enum(definition) => {
+                    cacheable_types.insert(definition.name.clone());
+                    cacheable_types.extend(
+                        definition
+                            .variants
+                            .iter()
+                            .map(|variant| variant.r#type.trim().to_owned()),
+                    );
+                }
+                _ => {}
+            }
+        }
         Ok(Self {
             entries: flattened,
             type_indices,
             function_indices,
+            cacheable_types,
             schema_results: Arc::new(RwLock::new(BTreeMap::new())),
         })
     }
@@ -172,10 +214,12 @@ impl ContractAbi {
             return result.clone();
         }
         let result = self.validate_type_graph(ty, &mut std::collections::BTreeSet::new(), 0);
-        self.schema_results
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(ty.to_owned(), result.clone());
+        if self.cacheable_types.contains(ty) {
+            self.schema_results
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(ty.to_owned(), result.clone());
+        }
         result
     }
     fn validate_type_graph(
@@ -685,6 +729,24 @@ mod tests {
     }
     fn abi() -> ContractAbi {
         ContractAbi::from_json(r#"[{"type":"struct","name":"core::integer::u256","members":[{"name":"low","type":"core::integer::u128"},{"name":"high","type":"core::integer::u128"}]},{"type":"enum","name":"Choice","variants":[{"name":"None","type":"()"},{"name":"Some","type":"core::integer::u256"}]},{"type":"interface","name":"I","items":[{"type":"function","name":"transfer","inputs":[{"name":"to","type":"core::starknet::contract_address::ContractAddress"},{"name":"amount","type":"core::integer::u256"}],"outputs":[{"type":"core::bool"}],"state_mutability":"external"}]}]"#).unwrap()
+    }
+    #[test]
+    fn arbitrary_standalone_type_names_do_not_grow_the_schema_cache() {
+        let abi = ContractAbi::from_json(r#"[{"type":"struct","name":"Empty","members":[]},{"type":"function","name":"consume","inputs":[{"name":"values","type":"core::array::Array::<Empty>"}],"outputs":[],"state_mutability":"external"}]"#).unwrap();
+        for index in 0..1_000 {
+            assert!(
+                abi.encode_value(&format!("Unknown{index}"), &AbiValue::Sequence(vec![]))
+                    .is_err()
+            );
+            let ty = format!("core::array::Array::<Unknown{index}>");
+            assert!(abi.decode_value(&ty, &mut [Felt::ZERO].as_slice()).is_err());
+        }
+        assert!(abi.schema_results.read().unwrap().is_empty());
+        for _ in 0..2 {
+            abi.encode_inputs("consume", &[AbiValue::Sequence(vec![])])
+                .unwrap();
+        }
+        assert_eq!(abi.schema_results.read().unwrap().len(), 1);
     }
     #[test]
     fn cached_recursive_schema_errors_remain_errors_after_clone() {
