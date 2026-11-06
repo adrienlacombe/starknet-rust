@@ -578,7 +578,7 @@ mod tests {
             "core::felt252",
         ] {
             let malformed = serde_json::json!({"type":"struct","name":ty,"members":[{"name":"bad","type":"Unknown"}]});
-            let json = serde_json::json!([malformed.clone()]).to_string();
+            let json = serde_json::json!([malformed]).to_string();
             let codec = EventTypes::new(serde_json::from_str(&json).unwrap());
 
             assert_eq!(
